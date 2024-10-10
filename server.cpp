@@ -1,11 +1,3 @@
-//
-// Simple chat server for TSAM-409
-//
-// Command line: ./chat_server <port> 
-//
-// Modified version: Without Client class
-//P
-
 #include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -27,12 +19,15 @@
 #include <thread>
 #include <ctime>
 
-#define BACKLOG 5          // Length of the queue of waiting connections
-
+#define BACKLOG 5              // Length of the queue of waiting connections
+#define SOH 0x01               // Start of Header (start of message)
+#define EOT 0x04               // End of Transmission (end of message)
+#define DLE 0x10               // Data Link Escape (for byte-stuffing)
 
 // Global data structures
-std::map<int, std::string> clients;          // Map of client sockets to group IDs
-std::map<std::string, std::list<std::string>> messageQueue;  // Messages per group
+std::map<int, std::string> clients; // Map of client sockets to group IDs
+std::map<std::string, std::list<std::string>> messageQueue; // Messages per group
+std::map<int, std::string> messageBuffer; // Buffer to store partial messages
 
 // Utility function to get the current timestamp as a string
 std::string getTimestamp()
@@ -47,6 +42,45 @@ std::string getTimestamp()
 void logMessage(const std::string &msg)
 {
     std::cout << "[" << getTimestamp() << "] " << msg << std::endl;
+}
+
+// Helper function to perform byte-stuffing on a message
+std::string byteStuffMessage(const std::string &message)
+{
+    std::string stuffedMessage;
+    for (char c : message)
+    {
+        if (c == SOH || c == EOT || c == DLE)
+        {
+            stuffedMessage += DLE;  // Insert escape character before control chars
+        }
+        stuffedMessage += c;
+    }
+    return stuffedMessage;
+}
+
+// Helper function to remove byte-stuffing from a received message
+std::string byteUnstuffMessage(const std::string &message)
+{
+    std::string unstuffedMessage;
+    bool escapeNext = false;
+    for (char c : message)
+    {
+        if (escapeNext)
+        {
+            unstuffedMessage += c;  // Add the actual escaped character
+            escapeNext = false;
+        }
+        else if (c == DLE)
+        {
+            escapeNext = true;  // Mark the next character as escaped
+        }
+        else
+        {
+            unstuffedMessage += c;
+        }
+    }
+    return unstuffedMessage;
 }
 
 // Open socket for specified port.
@@ -102,57 +136,72 @@ void closeClient(int clientSocket, fd_set *openSockets, int *maxfds)
     // Remove from the list of open sockets
     FD_CLR(clientSocket, openSockets);
     clients.erase(clientSocket);
+    messageBuffer.erase(clientSocket); // Clear any partial message buffer
 }
 
+// Process the completed message
 // Process command from client or server
-void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, char *buffer)
+void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const std::string &command)
 {
     std::vector<std::string> tokens;
     std::string token;
-    std::stringstream stream(buffer);
+    std::stringstream stream(command);
 
     // Split command from client into tokens for parsing
-    while (stream >> token)
+    while (std::getline(stream, token, ','))
         tokens.push_back(token);
 
     // Handle the commands from servers and clients
     if (tokens[0].compare("HELO") == 0 && tokens.size() == 2)
     {
-        logMessage("HELO received from " + tokens[1]);
+        std::string fromGroup = tokens[1];
+        clients[clientSocket] = fromGroup;  // Register client with its group ID
+        
+        logMessage("HELO received from " + fromGroup);
+
+        // Respond with SERVERS list
         std::string response = "SERVERS";
         for (const auto &client : clients)
         {
-            response += "," + client.second;
+            response += "," + client.second + ",<IP>,<PORT>";  // You need to replace <IP> and <PORT> with real values
         }
         send(clientSocket, response.c_str(), response.length(), 0);
     }
     else if (tokens[0].compare("KEEPALIVE") == 0 && tokens.size() == 2)
     {
-        logMessage("KEEPALIVE received from client: " + std::to_string(clientSocket));
-        // Respond or handle keepalive logic here
+        std::string fromGroup = clients[clientSocket];
+        int numMessages = std::stoi(tokens[1]);
+
+        logMessage("KEEPALIVE received from client: " + fromGroup + ", No. of Messages: " + std::to_string(numMessages));
+
+        // Handle keepalive logic if needed, e.g., updating a timestamp for the client
     }
-    else if (tokens[0].compare("SENDMSG") == 0 && tokens.size() >= 3)
+    else if (tokens[0].compare("SENDMSG") == 0 && tokens.size() >= 4)
     {
         std::string toGroup = tokens[1];
-        std::string fromGroup = clients[clientSocket];
-        std::string message = tokens[2];
+        std::string fromGroup = tokens[2];
+        std::string messageContent = tokens[3];
 
-        for (auto i = tokens.begin() + 3; i != tokens.end(); ++i)
+        for (size_t i = 4; i < tokens.size(); ++i)
         {
-            message += " " + *i;
+            messageContent += "," + tokens[i];
         }
 
-        logMessage("Message from " + fromGroup + " to " + toGroup + ": " + message);
-        messageQueue[toGroup].push_back(fromGroup + ": " + message);
+        logMessage("Message from " + fromGroup + " to " + toGroup + ": " + messageContent);
 
+        // Queue the message for the destination group
+        messageQueue[toGroup].push_back(fromGroup + ": " + messageContent);
+
+        // Acknowledge the message was received
         std::string ack = "Message sent to " + toGroup;
         send(clientSocket, ack.c_str(), ack.length(), 0);
     }
-    else if (tokens[0].compare("GETMSG") == 0 && tokens.size() == 2)
+    else if (tokens[0].compare("GETMSGS") == 0 && tokens.size() == 2)
     {
         std::string group = tokens[1];
         if (!messageQueue[group].empty())
         {
+            // Retrieve the next message for the group
             std::string message = messageQueue[group].front();
             messageQueue[group].pop_front();
             send(clientSocket, message.c_str(), message.length(), 0);
@@ -163,18 +212,59 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, char *bu
             send(clientSocket, noMessages.c_str(), noMessages.length(), 0);
         }
     }
-    else if (tokens[0].compare("LISTSERVERS") == 0)
+    else if (tokens[0].compare("STATUSREQ") == 0)
     {
-        std::string serverList = "Connected servers: ";
-        for (const auto &client : clients)
+        logMessage("STATUSREQ received from client.");
+
+        // Generate the STATUSRESP message
+        std::string response = "STATUSRESP";
+        for (const auto &queue : messageQueue)
         {
-            serverList += client.second + ",";
+            response += "," + queue.first + "," + std::to_string(queue.second.size());
         }
-        send(clientSocket, serverList.c_str(), serverList.length() - 1, 0);
+        send(clientSocket, response.c_str(), response.length(), 0);
     }
     else
     {
-        logMessage("Unknown command from client: " + std::string(buffer));
+        logMessage("Unknown command from client: " + command);
+    }
+}
+
+
+// Read incoming data and accumulate it until a full message is received
+void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
+{
+    char buffer[1024];
+    int bytes = recv(clientSocket, buffer, sizeof(buffer), 0);
+
+    if (bytes <= 0)
+    {
+        closeClient(clientSocket, openSockets, maxfds);
+        return;
+    }
+
+    // Accumulate received data into the buffer for this client
+    messageBuffer[clientSocket].append(buffer, bytes);
+
+    // Process any complete messages (from SOH to EOT)
+    std::string &clientData = messageBuffer[clientSocket];
+    size_t startPos = clientData.find(SOH); // Find the start of a message
+
+    while (startPos != std::string::npos)
+    {
+        size_t endPos = clientData.find(EOT, startPos + 1); // Find the end of the message
+        if (endPos == std::string::npos)
+        {
+            break; // Incomplete message, wait for more data
+        }
+
+        // Extract and process the complete message
+        std::string completeMessage = clientData.substr(startPos + 1, endPos - startPos - 1);
+        processCommand(clientSocket, openSockets, maxfds, completeMessage);
+
+        // Remove the processed message from the buffer
+        clientData = clientData.substr(endPos + 1);
+        startPos = clientData.find(SOH); // Look for another message
     }
 }
 
@@ -190,6 +280,7 @@ int main(int argc, char *argv[])
     struct sockaddr_in client;
     socklen_t clientLen;
     char buffer[1025];              // buffer for reading from clients
+    std::map<int, std::string> partialMessages;  // For message accumulation
 
     if (argc != 2)
     {
@@ -218,6 +309,7 @@ int main(int argc, char *argv[])
         readSockets = exceptSockets = openSockets;
         memset(buffer, 0, sizeof(buffer));
 
+        // Wait for activity on sockets (using select)
         int n = select(maxfds + 1, &readSockets, NULL, &exceptSockets, NULL);
 
         if (n < 0)
@@ -227,7 +319,7 @@ int main(int argc, char *argv[])
         }
         else
         {
-            // Accept any new connections on the listening socket
+            // Accept new connections on the listening socket
             if (FD_ISSET(listenSock, &readSockets))
             {
                 clientSock = accept(listenSock, (struct sockaddr *)&client, &clientLen);
@@ -238,29 +330,73 @@ int main(int argc, char *argv[])
                 FD_SET(clientSock, &openSockets);
                 maxfds = std::max(maxfds, clientSock);
 
-                // Assign a temporary group ID for the new client (can be changed later)
+                // Assign a temporary group ID for the new client
                 clients[clientSock] = "Group" + std::to_string(clientSock);
             }
 
-            // Now check for client messages
+            // Process each client with pending data
             for (const auto &pair : clients)
             {
                 int clientSock = pair.first;
+
                 if (FD_ISSET(clientSock, &readSockets))
                 {
-                    int bytes = recv(clientSock, buffer, sizeof(buffer), 0);
+                    int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
                     if (bytes > 0)
                     {
-                        buffer[bytes] = '\0';
-                        logMessage("Received message: " + std::string(buffer));
-                        processCommand(clientSock, &openSockets, &maxfds, buffer);
+                        buffer[bytes] = '\0';  // Null-terminate the received data
+                        
+                        // Accumulate message and handle byte-stuffing (assuming SOH = 0x01, EOT = 0x04)
+                        std::string incomingData(buffer);
+                        std::string &partialMessage = partialMessages[clientSock];
+
+                        partialMessage += incomingData;
+
+                        size_t startPos = partialMessage.find(0x01);  // Start of message
+                        size_t endPos = partialMessage.find(0x04);    // End of message
+
+                        // Process message if SOH and EOT are found
+                        if (startPos != std::string::npos && endPos != std::string::npos && endPos > startPos)
+                        {
+                            std::string fullMessage = partialMessage.substr(startPos + 1, endPos - startPos - 1);  // Extract message content
+                            partialMessage.erase(0, endPos + 1);  // Remove processed message
+
+                            // Handle byte-stuffing by unescaping any stuffed characters
+                            std::string unescapedMessage;
+                            bool escapeNext = false;
+                            for (char c : fullMessage)
+                            {
+                                if (escapeNext)
+                                {
+                                    unescapedMessage += c;
+                                    escapeNext = false;
+                                }
+                                else if (c == 0x10)  // If escape character (byte-stuffing) found
+                                {
+                                    escapeNext = true;
+                                }
+                                else
+                                {
+                                    unescapedMessage += c;
+                                }
+                            }
+
+                            // Process the fully accumulated and unescaped message
+                            logMessage("Received message: " + unescapedMessage);
+                            processCommand(clientSock, &openSockets, &maxfds, unescapedMessage);
+                        }
                     }
                     else
                     {
+                        // If recv returns 0, the client has disconnected
                         closeClient(clientSock, &openSockets, &maxfds);
                     }
                 }
             }
         }
     }
+
+    // Close listening socket when finished
+    close(listenSock);
+    return 0;
 }
