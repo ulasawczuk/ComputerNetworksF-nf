@@ -19,15 +19,15 @@
 #include <thread>
 #include <ctime>
 
-#define BACKLOG 5              // Length of the queue of waiting connections
-#define SOH 0x01               // Start of Header (start of message)
-#define EOT 0x04               // End of Transmission (end of message)
-#define DLE 0x10               // Data Link Escape (for byte-stuffing)
+#define BACKLOG 5              
+#define SOH 0x01               
+#define EOT 0x04              
+#define DLE 0x10               
 
 // Global data structures
-std::map<int, std::string> clients; // Map of client sockets to group IDs
-std::map<std::string, std::list<std::string>> messageQueue; // Messages per group
-std::map<int, std::string> messageBuffer; // Buffer to store partial messages
+std::map<int, std::string> clients; 
+std::map<std::string, std::list<std::string>> messageQueue; 
+std::map<int, std::string> messageBuffer; 
 
 // Utility function to get the current timestamp as a string
 std::string getTimestamp()
@@ -44,6 +44,7 @@ void logMessage(const std::string &msg)
     std::cout << "[" << getTimestamp() << "] " << msg << std::endl;
 }
 
+/*
 // Helper function to perform byte-stuffing on a message
 std::string byteStuffMessage(const std::string &message)
 {
@@ -58,6 +59,7 @@ std::string byteStuffMessage(const std::string &message)
     }
     return stuffedMessage;
 }
+
 
 // Helper function to remove byte-stuffing from a received message
 std::string byteUnstuffMessage(const std::string &message)
@@ -82,6 +84,7 @@ std::string byteUnstuffMessage(const std::string &message)
     }
     return unstuffedMessage;
 }
+*/
 
 // Open socket for specified port.
 // Returns -1 if unable to create the socket for any reason.
