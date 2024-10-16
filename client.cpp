@@ -1,10 +1,3 @@
-//
-// Simple chat client for TSAM-409
-//
-// Command line: ./chat_client 4000 
-//
-// Author: Jacky Mallett (jacky@ru.is)
-//
 #include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -18,121 +11,104 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <algorithm>
-#include <map>
-#include <vector>
-#include <thread>
-
 #include <iostream>
-#include <sstream>
 #include <thread>
-#include <map>
 
-// Threaded function for handling responss from server
+#define SOH 0x01 // Start of Header
+#define EOT 0x04 // End of Transmission
 
-void listenServer(int serverSocket)
-{
-    int nread;                                  // Bytes read from socket
-    char buffer[1025];                          // Buffer for reading input
+void logMessage(const std::string &msg) {
+    std::cout << "[Client] " << msg << std::endl;
+}
 
-    while(true)
-    {
-       memset(buffer, 0, sizeof(buffer));
-       nread = read(serverSocket, buffer, sizeof(buffer));
+void listenServer(int serverSocket) {
+    int nread;
+    char buffer[1025];
 
-       if(nread == 0)                      // Server has dropped us
-       {
-          printf("Over and Out\n");
-          exit(0);
-       }
-       else if(nread > 0)
-       {
-          printf("%s\n", buffer);
-       }
-       printf("here\n");
+    logMessage("Listening for server messages...");
+
+    while (true) {
+        memset(buffer, 0, sizeof(buffer));
+        nread = read(serverSocket, buffer, sizeof(buffer));
+
+        if (nread == 0) { // Server has dropped us
+            logMessage("Server closed connection. Exiting.");
+            exit(0);
+        } else if (nread > 0) {
+            logMessage("Received message from server: " + std::string(buffer));
+        } else {
+            perror("Error reading from server");
+            exit(1);
+        }
     }
 }
 
-int main(int argc, char* argv[])
-{
-   struct addrinfo hints, *svr;              // Network host entry for server
-   struct sockaddr_in serv_addr;           // Socket address for server
-   int serverSocket;                         // Socket used for server 
-   int nwrite;                               // No. bytes written to server
-   char buffer[1025];                        // buffer for writing to server
-   bool finished;                   
-   int set = 1;                              // Toggle for setsockopt
+int main(int argc, char *argv[]) {
+    int sock;
+    struct sockaddr_in server;
+    struct hostent *hp;
+    char buffer[1025];
+    bool finished = false;
 
-   if(argc != 3)
-   {
-        printf("Usage: chat_client <ip  port>\n");
-        printf("Ctrl-C to terminate\n");
-        exit(0);
-   }
+    if (argc != 3) {
+        printf("Usage: chat_client <server_ip> <server_port>\n");
+        exit(1);
+    }
 
-   hints.ai_family   = AF_INET;            // IPv4 only addresses
-   hints.ai_socktype = SOCK_STREAM;
+    logMessage("Starting client...");
 
-   memset(&hints,   0, sizeof(hints));
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("Failed to open socket");
+        exit(1);
+    }
+    logMessage("Socket created.");
 
-   if(getaddrinfo(argv[1], argv[2], &hints, &svr) != 0)
-   {
-       perror("getaddrinfo failed: ");
-       exit(0);
-   }
+    server.sin_family = AF_INET;
+    hp = gethostbyname(argv[1]);
+    if (hp == 0) {
+        perror("Unknown host");
+        close(sock);
+        exit(1);
+    }
 
-   struct hostent *server;
-   server = gethostbyname(argv[1]);
+    memcpy(&server.sin_addr, hp->h_addr, hp->h_length);
+    server.sin_port = htons(atoi(argv[2]));
 
-   bzero((char *) &serv_addr, sizeof(serv_addr));
-   serv_addr.sin_family = AF_INET;
-   bcopy((char *)server->h_addr,
-      (char *)&serv_addr.sin_addr.s_addr,
-      server->h_length);
-   serv_addr.sin_port = htons(atoi(argv[2]));
+    logMessage("Connecting to server at " + std::string(argv[1]) + ":" + std::string(argv[2]) + "...");
 
-   serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0) {
+        perror("Failed to connect to server");
+        close(sock);
+        exit(1);
+    }
 
-   // Turn on SO_REUSEADDR to allow socket to be quickly reused after 
-   // program exit.
+    logMessage("Connected to server.");
 
-   if(setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &set, sizeof(set)) < 0)
-   {
-       printf("Failed to set SO_REUSEADDR for port %s\n", argv[2]);
-       perror("setsockopt failed: ");
-   }
+    std::thread listenThread(listenServer, sock);
 
-   
-   if(connect(serverSocket, (struct sockaddr *)&serv_addr, sizeof(serv_addr) )< 0)
-   {
-       // EINPROGRESS means that the connection is still being setup. Typically this
-       // only occurs with non-blocking sockets. (The serverSocket above is explicitly
-       // not in non-blocking mode, so this check here is just an example of how to
-       // handle this properly.)
-       if(errno != EINPROGRESS)
-       {
-         printf("Failed to open socket to server: %s\n", argv[1]);
-         perror("Connect failed: ");
-         exit(0);
-       }
-   }
+    while (!finished) {
+        memset(buffer, 0, sizeof(buffer));
+        fgets(buffer, sizeof(buffer), stdin);
+        
+        // Remove newline character from the input
+        buffer[strcspn(buffer, "\n")] = 0;
 
-    // Listen and print replies from server
-   std::thread serverThread(listenServer, serverSocket);
+        // Create the message with SOH and EOT
+        std::string messageToSend;
+        messageToSend += static_cast<char>(SOH);  // Add SOH
+        messageToSend += buffer;                    // Add the actual message
+        messageToSend += static_cast<char>(EOT);  // Add EOT
 
-   finished = false;
-   while(!finished)
-   {
-       bzero(buffer, sizeof(buffer));
+        if (write(sock, messageToSend.c_str(), messageToSend.length()) < 0) {
+            perror("Failed to write to server");
+            close(sock);
+            exit(1);
+        }
+        logMessage("Sent message to server: " + std::string(buffer));
+    }
 
-       fgets(buffer, sizeof(buffer), stdin);
-
-       nwrite = send(serverSocket, buffer, strlen(buffer),0);
-
-       if(nwrite  == -1)
-       {
-           perror("send() to server failed: ");
-           finished = true;
-       }
-
-   }
+    close(sock);
+    listenThread.join();
+    return 0;
 }

@@ -44,48 +44,6 @@ void logMessage(const std::string &msg)
     std::cout << "[" << getTimestamp() << "] " << msg << std::endl;
 }
 
-/*
-// Helper function to perform byte-stuffing on a message
-std::string byteStuffMessage(const std::string &message)
-{
-    std::string stuffedMessage;
-    for (char c : message)
-    {
-        if (c == SOH || c == EOT || c == DLE)
-        {
-            stuffedMessage += DLE;  // Insert escape character before control chars
-        }
-        stuffedMessage += c;
-    }
-    return stuffedMessage;
-}
-
-
-// Helper function to remove byte-stuffing from a received message
-std::string byteUnstuffMessage(const std::string &message)
-{
-    std::string unstuffedMessage;
-    bool escapeNext = false;
-    for (char c : message)
-    {
-        if (escapeNext)
-        {
-            unstuffedMessage += c;  // Add the actual escaped character
-            escapeNext = false;
-        }
-        else if (c == DLE)
-        {
-            escapeNext = true;  // Mark the next character as escaped
-        }
-        else
-        {
-            unstuffedMessage += c;
-        }
-    }
-    return unstuffedMessage;
-}
-*/
-
 // Open socket for specified port.
 // Returns -1 if unable to create the socket for any reason.
 int open_socket(int portno)
@@ -94,17 +52,22 @@ int open_socket(int portno)
     int sock;                     // Socket opened for this port
     int set = 1;                  // For setsockopt
 
+    logMessage("Attempting to open socket...");
+
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0)
     {
         perror("Failed to open socket");
         return -1;
     }
+    logMessage("Socket opened successfully.");
 
     // Turn on SO_REUSEADDR to allow the socket to be quickly reused after program exit.
     if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &set, sizeof(set)) < 0)
     {
-        perror("Failed to set SO_REUSEADDR:");
+        perror("Failed to set SO_REUSEADDR");
+        return -1;
     }
+    logMessage("SO_REUSEADDR set successfully.");
 
     memset(&sk_addr, 0, sizeof(sk_addr));
     sk_addr.sin_family = AF_INET;
@@ -112,11 +75,13 @@ int open_socket(int portno)
     sk_addr.sin_port = htons(portno);
 
     // Bind the socket to listen for connections
+    logMessage("Binding socket to port " + std::to_string(portno) + "...");
     if (bind(sock, (struct sockaddr *)&sk_addr, sizeof(sk_addr)) < 0)
     {
-        perror("Failed to bind to socket:");
+        perror("Failed to bind to socket");
         return -1;
     }
+    logMessage("Socket bound to port " + std::to_string(portno) + " successfully.");
 
     return sock;
 }
@@ -124,8 +89,7 @@ int open_socket(int portno)
 // Close a client's connection, remove from the client list, and tidy up select sockets afterwards.
 void closeClient(int clientSocket, fd_set *openSockets, int *maxfds)
 {
-    printf("Client closed connection: %d\n", clientSocket);
-
+    logMessage("Closing client connection: " + std::to_string(clientSocket));
     close(clientSocket);
 
     if (*maxfds == clientSocket)
@@ -136,14 +100,13 @@ void closeClient(int clientSocket, fd_set *openSockets, int *maxfds)
         }
     }
 
-    // Remove from the list of open sockets
     FD_CLR(clientSocket, openSockets);
     clients.erase(clientSocket);
     messageBuffer.erase(clientSocket); // Clear any partial message buffer
+    logMessage("Client connection closed: " + std::to_string(clientSocket));
 }
 
-// Process the completed message
-// Process command from client or server
+// Process the completed message and handle commands from clients.
 void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const std::string &command)
 {
     std::vector<std::string> tokens;
@@ -206,7 +169,7 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
         {
             // Retrieve the next message for the group
             std::string message = messageQueue[group].front();
-            messageQueue[group].pop_front();
+            //messageQueue[group].pop_front();
             send(clientSocket, message.c_str(), message.length(), 0);
         }
         else
@@ -233,7 +196,6 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
     }
 }
 
-
 // Read incoming data and accumulate it until a full message is received
 void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
 {
@@ -242,48 +204,48 @@ void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
 
     if (bytes <= 0)
     {
+        logMessage("Client " + std::to_string(clientSocket) + " disconnected or recv() failed.");
         closeClient(clientSocket, openSockets, maxfds);
         return;
     }
 
     // Accumulate received data into the buffer for this client
     messageBuffer[clientSocket].append(buffer, bytes);
+    logMessage("Received " + std::to_string(bytes) + " bytes from client " + std::to_string(clientSocket));
+    logMessage("Accumulated data from client " + std::to_string(clientSocket) + ": " + messageBuffer[clientSocket]);
 
     // Process any complete messages (from SOH to EOT)
     std::string &clientData = messageBuffer[clientSocket];
-    size_t startPos = clientData.find(SOH); // Find the start of a message
+    size_t startPos = clientData.find(SOH);
 
     while (startPos != std::string::npos)
     {
-        size_t endPos = clientData.find(EOT, startPos + 1); // Find the end of the message
+        size_t endPos = clientData.find(EOT, startPos + 1);
         if (endPos == std::string::npos)
         {
-            break; // Incomplete message, wait for more data
+            break;
         }
 
-        // Extract and process the complete message
         std::string completeMessage = clientData.substr(startPos + 1, endPos - startPos - 1);
-        processCommand(clientSocket, openSockets, maxfds, completeMessage);
+        logMessage("Complete message received from client " + std::to_string(clientSocket) + ": " + completeMessage);
 
-        // Remove the processed message from the buffer
+        processCommand(clientSocket, openSockets, maxfds, completeMessage);
         clientData = clientData.substr(endPos + 1);
-        startPos = clientData.find(SOH); // Look for another message
+        startPos = clientData.find(SOH);
     }
 }
+
+
 
 int main(int argc, char *argv[])
 {
     bool finished = false;
-    int listenSock;                 // Socket for connections to server
-    int clientSock;                 // Socket of connecting client
-    fd_set openSockets;             // Current open sockets 
-    fd_set readSockets;             // Socket list for select()        
-    fd_set exceptSockets;           // Exception socket list
-    int maxfds;                     // Passed to select() as max fd in set
+    int listenSock;
+    int clientSock;
+    fd_set openSockets, readSockets, exceptSockets;
+    int maxfds;
     struct sockaddr_in client;
     socklen_t clientLen;
-    char buffer[1025];              // buffer for reading from clients
-    std::map<int, std::string> partialMessages;  // For message accumulation
 
     if (argc != 2)
     {
@@ -291,115 +253,67 @@ int main(int argc, char *argv[])
         exit(0);
     }
 
-    // Setup socket for server to listen to
+    logMessage("Starting chat server...");
+
     listenSock = open_socket(atoi(argv[1]));
-    printf("Listening on port: %d\n", atoi(argv[1]));
+    if (listenSock < 0)
+    {
+        logMessage("Failed to start server.");
+        exit(0);
+    }
+
+    logMessage("Listening on port: " + std::to_string(atoi(argv[1])));
 
     if (listen(listenSock, BACKLOG) < 0)
     {
-        printf("Listen failed on port %s\n", argv[1]);
+        perror("Listen failed");
         exit(0);
     }
-    else
-    {
-        FD_ZERO(&openSockets);
-        FD_SET(listenSock, &openSockets);
-        maxfds = listenSock;
-    }
+
+    FD_ZERO(&openSockets);
+    FD_SET(listenSock, &openSockets);
+    maxfds = listenSock;
+
+    logMessage("Waiting for connections...");
 
     while (!finished)
     {
         readSockets = exceptSockets = openSockets;
-        memset(buffer, 0, sizeof(buffer));
-
-        // Wait for activity on sockets (using select)
         int n = select(maxfds + 1, &readSockets, NULL, &exceptSockets, NULL);
 
         if (n < 0)
         {
-            perror("select failed - closing down\n");
+            perror("Select failed");
             finished = true;
         }
         else
         {
-            // Accept new connections on the listening socket
             if (FD_ISSET(listenSock, &readSockets))
             {
                 clientSock = accept(listenSock, (struct sockaddr *)&client, &clientLen);
-
-                printf("Client connected on server: %d\n", clientSock);
-
-                // Add new client to the list of open sockets
+                if (clientSock < 0)
+                {
+                    perror("Accept failed");
+                    continue;
+                }
+                logMessage("Client connected on server: " + std::to_string(clientSock));
                 FD_SET(clientSock, &openSockets);
                 maxfds = std::max(maxfds, clientSock);
-
-                // Assign a temporary group ID for the new client
                 clients[clientSock] = "Group" + std::to_string(clientSock);
             }
 
-            // Process each client with pending data
             for (const auto &pair : clients)
             {
                 int clientSock = pair.first;
-
                 if (FD_ISSET(clientSock, &readSockets))
                 {
-                    int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
-                    if (bytes > 0)
-                    {
-                        buffer[bytes] = '\0';  // Null-terminate the received data
-                        
-                        // Accumulate message and handle byte-stuffing (assuming SOH = 0x01, EOT = 0x04)
-                        std::string incomingData(buffer);
-                        std::string &partialMessage = partialMessages[clientSock];
-
-                        partialMessage += incomingData;
-
-                        size_t startPos = partialMessage.find(0x01);  // Start of message
-                        size_t endPos = partialMessage.find(0x04);    // End of message
-
-                        // Process message if SOH and EOT are found
-                        if (startPos != std::string::npos && endPos != std::string::npos && endPos > startPos)
-                        {
-                            std::string fullMessage = partialMessage.substr(startPos + 1, endPos - startPos - 1);  // Extract message content
-                            partialMessage.erase(0, endPos + 1);  // Remove processed message
-
-                            // Handle byte-stuffing by unescaping any stuffed characters
-                            std::string unescapedMessage;
-                            bool escapeNext = false;
-                            for (char c : fullMessage)
-                            {
-                                if (escapeNext)
-                                {
-                                    unescapedMessage += c;
-                                    escapeNext = false;
-                                }
-                                else if (c == 0x10)  // If escape character (byte-stuffing) found
-                                {
-                                    escapeNext = true;
-                                }
-                                else
-                                {
-                                    unescapedMessage += c;
-                                }
-                            }
-
-                            // Process the fully accumulated and unescaped message
-                            logMessage("Received message: " + unescapedMessage);
-                            processCommand(clientSock, &openSockets, &maxfds, unescapedMessage);
-                        }
-                    }
-                    else
-                    {
-                        // If recv returns 0, the client has disconnected
-                        closeClient(clientSock, &openSockets, &maxfds);
-                    }
+                    readClientData(clientSock, &openSockets, &maxfds);
                 }
             }
         }
     }
 
-    // Close listening socket when finished
     close(listenSock);
+    logMessage("Server shutting down...");
     return 0;
 }
