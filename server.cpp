@@ -28,6 +28,8 @@
 std::map<int, std::string> clients; 
 std::map<std::string, std::list<std::string>> messageQueue; 
 std::map<int, std::string> messageBuffer; 
+std::map<std::string, std::pair<std::string, int>> oneHopServers; 
+
 
 // Utility function to get the current timestamp as a string
 std::string getTimestamp()
@@ -127,9 +129,14 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
 
         // Respond with SERVERS list
         std::string response = "SERVERS";
-        for (const auto &client : clients)
+        response += fromGroup + "," + oneHopServers[fromGroup].first + "," + std::to_string(oneHopServers[fromGroup].second);
+
+        for (const auto &server : oneHopServers)
         {
-            response += "," + client.second + ",<IP>,<PORT>";  // You need to replace <IP> and <PORT> with real values
+            if (server.first != fromGroup) // Avoid repeating the sender
+            {
+                response += ";" + server.first + "," + server.second.first + "," + std::to_string(server.second.second);
+            }
         }
         send(clientSocket, response.c_str(), response.length(), 0);
     }
@@ -236,6 +243,65 @@ void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
 }
 
 
+// Function to connect to an instructor server and send a HELO message
+void connectToInstructorServers()
+{
+    std::vector<std::tuple<std::string, int, std::string>> instructorServers = {
+        {"Instr_1", 5001, "130.208.246.249"},
+        {"Instr_2", 5002, "130.208.246.249"},
+        {"Instr_3", 5003, "130.208.246.249"}
+    };
+
+    for (const auto& [name, port, ip] : instructorServers)
+    {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0)
+        {
+            perror("Failed to open socket for instructor server");
+            continue;
+        }
+
+        sockaddr_in server;
+        server.sin_family = AF_INET;
+        inet_pton(AF_INET, ip.c_str(), &server.sin_addr);
+        server.sin_port = htons(port);
+
+        if (connect(sock, (struct sockaddr*)&server, sizeof(server)) < 0)
+        {
+            perror("Failed to connect to instructor server");
+            close(sock);
+            continue;
+        }
+
+        logMessage("Connected to instructor server: " + name + " at " + ip + ":" + std::to_string(port));
+
+        // Send HELO message
+        std::string fromGroup = "A5_12"; 
+        std::string helloMessage = "HELO," + fromGroup;
+        send(sock, helloMessage.c_str(), helloMessage.length(), 0);
+        logMessage("Sent HELO message to " + name);
+
+        // Read response
+        char buffer[1024];
+        int bytesRead = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (bytesRead > 0)
+        {
+            buffer[bytesRead] = '\0'; // Null-terminate the received data
+            std::string response(buffer);
+            logMessage("Received response from " + name + ": " + response);
+
+            oneHopServers[name] = {ip, port}; // Store server info
+        }
+        else
+        {
+            logMessage("Failed to receive response from " + name);
+        }
+
+        close(sock); // Close the socket after communication
+    }
+}
+
+
 
 int main(int argc, char *argv[])
 {
@@ -273,6 +339,13 @@ int main(int argc, char *argv[])
     FD_ZERO(&openSockets);
     FD_SET(listenSock, &openSockets);
     maxfds = listenSock;
+
+
+    std::cout << "CONNECTING TO INSTUCTORS SERVERS" << std::endl;
+    // Connect to specified instructor servers and send HELO messages
+    connectToInstructorServers();
+
+    std::cout << "DONE CONNECTING TO INSTUCTORS SERVERS" << std::endl;
 
     logMessage("Waiting for connections...");
 
