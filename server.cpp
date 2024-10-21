@@ -18,19 +18,31 @@
 #include <sstream>
 #include <thread>
 #include <ctime>
+#include <string>
 
-#define BACKLOG 5              
-#define SOH 0x01               
-#define EOT 0x04              
-#define DLE 0x10               
+#define BACKLOG 5
+#define SOH 0x01
+#define EOT 0x04
+#define DLE 0x10
+#define ESC 0x1B
 
 // Global data structures
-std::map<int, std::string> clients; 
-std::map<std::string, std::list<std::string>> messageQueue; 
-std::map<int, std::string> messageBuffer; 
-std::map<std::string, std::pair<std::string, int>> oneHopServers; 
+std::map<int, std::string> clients;
+std::map<std::string, std::list<std::string>> messageQueue;
+std::map<int, std::string> messageBuffer;
+std::map<std::string, std::pair<std::string, int>> oneHopServerse;
 
+// Define a struct to hold server information
+struct ServerInfo
+{
+    std::string name; // Server name
+    std::string ip;   // IP address
+    int port;         // Port number
 
+    // No constructer plese
+};
+
+std::map<int, ServerInfo> oneHopServers;
 // Utility function to get the current timestamp as a string
 std::string getTimestamp()
 {
@@ -50,9 +62,9 @@ void logMessage(const std::string &msg)
 // Returns -1 if unable to create the socket for any reason.
 int open_socket(int portno)
 {
-    struct sockaddr_in sk_addr;   // Address settings for bind()
-    int sock;                     // Socket opened for this port
-    int set = 1;                  // For setsockopt
+    struct sockaddr_in sk_addr; // Address settings for bind()
+    int sock;                   // Socket opened for this port
+    int set = 1;                // For setsockopt
 
     logMessage("Attempting to open socket...");
 
@@ -123,19 +135,26 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
     if (tokens[0].compare("HELO") == 0 && tokens.size() == 2)
     {
         std::string fromGroup = tokens[1];
-        clients[clientSocket] = fromGroup;  // Register client with its group ID
-        
+        clients[clientSocket] = fromGroup; // Register client with its group ID
+
         logMessage("HELO received from " + fromGroup);
 
+        if (oneHopServers[clientSocket].name.compare("m") == 0)
+        {
+            oneHopServers[clientSocket].name = fromGroup;
+        }
+
         // Respond with SERVERS list
-        std::string response = "SERVERS";
-        response += fromGroup + "," + oneHopServers[fromGroup].first + "," + std::to_string(oneHopServers[fromGroup].second);
+        std::string response = "SERVERS,";
+        response += fromGroup + "," + oneHopServers[clientSocket].ip + "," + std::to_string(oneHopServers[clientSocket].port);
 
         for (const auto &server : oneHopServers)
         {
-            if (server.first != fromGroup) // Avoid repeating the sender
+            logMessage("Going through list of size " + std::to_string(oneHopServers.size()));
+
+            if (server.second.name != fromGroup) // Avoid repeating the sender
             {
-                response += ";" + server.first + "," + server.second.first + "," + std::to_string(server.second.second);
+                response += ";" + server.second.name + "," + server.second.ip + "," + std::to_string(server.second.port);
             }
         }
         send(clientSocket, response.c_str(), response.length(), 0);
@@ -176,7 +195,7 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
         {
             // Retrieve the next message for the group
             std::string message = messageQueue[group].front();
-            //messageQueue[group].pop_front();
+            // messageQueue[group].pop_front();
             send(clientSocket, message.c_str(), message.length(), 0);
         }
         else
@@ -212,7 +231,7 @@ void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
     if (bytes <= 0)
     {
         logMessage("Client " + std::to_string(clientSocket) + " disconnected or recv() failed.");
-        closeClient(clientSocket, openSockets, maxfds);
+        // closeClient(clientSocket, openSockets, maxfds);
         return;
     }
 
@@ -227,10 +246,15 @@ void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
 
     while (startPos != std::string::npos)
     {
-        size_t endPos = clientData.find(EOT, startPos + 1);
-        if (endPos == std::string::npos)
+        size_t endPos;
+        size_t potEndPos = clientData.find(EOT, startPos + 1);
+        if (potEndPos == std::string::npos)
         {
             break;
+        }
+        if (clientData[potEndPos - 1] != ESC)
+        {
+            endPos = potEndPos;
         }
 
         std::string completeMessage = clientData.substr(startPos + 1, endPos - startPos - 1);
@@ -242,17 +266,15 @@ void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
     }
 }
 
-
 // Function to connect to an instructor server and send a HELO message
 void connectToInstructorServers()
 {
     std::vector<std::tuple<std::string, int, std::string>> instructorServers = {
         {"Instr_1", 5001, "130.208.246.249"},
         {"Instr_2", 5002, "130.208.246.249"},
-        {"Instr_3", 5003, "130.208.246.249"}
-    };
+        {"Instr_3", 5003, "130.208.246.249"}};
 
-    for (const auto& [name, port, ip] : instructorServers)
+    for (const auto &[name, port, ip] : instructorServers)
     {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0)
@@ -266,7 +288,7 @@ void connectToInstructorServers()
         inet_pton(AF_INET, ip.c_str(), &server.sin_addr);
         server.sin_port = htons(port);
 
-        if (connect(sock, (struct sockaddr*)&server, sizeof(server)) < 0)
+        if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0)
         {
             perror("Failed to connect to instructor server");
             close(sock);
@@ -276,7 +298,7 @@ void connectToInstructorServers()
         logMessage("Connected to instructor server: " + name + " at " + ip + ":" + std::to_string(port));
 
         // Send HELO message
-        std::string fromGroup = "A5_12"; 
+        std::string fromGroup = "A5_12";
         std::string helloMessage = "HELO," + fromGroup;
         send(sock, helloMessage.c_str(), helloMessage.length(), 0);
         logMessage("Sent HELO message to " + name);
@@ -288,20 +310,17 @@ void connectToInstructorServers()
         {
             buffer[bytesRead] = '\0'; // Null-terminate the received data
             std::string response(buffer);
-            logMessage("Received response from " + name + ": " + response);
-
-            oneHopServers[name] = {ip, port}; // Store server info
+            ServerInfo newSocket = {name, ip, port};
+            oneHopServers[sock] = newSocket; // Store server info
+            // logMessage("Received response from socket" + std::to_string(sock) + " : " + oneHopServers[sock].name);
+            logMessage("Received response from socket" + std::to_string(sock) + " : " + response);
         }
         else
         {
             logMessage("Failed to receive response from " + name);
         }
-
-        close(sock); // Close the socket after communication
     }
 }
-
-
 
 int main(int argc, char *argv[])
 {
@@ -340,7 +359,6 @@ int main(int argc, char *argv[])
     FD_SET(listenSock, &openSockets);
     maxfds = listenSock;
 
-
     std::cout << "CONNECTING TO INSTUCTORS SERVERS" << std::endl;
     // Connect to specified instructor servers and send HELO messages
     connectToInstructorServers();
@@ -369,10 +387,24 @@ int main(int argc, char *argv[])
                     perror("Accept failed");
                     continue;
                 }
-                logMessage("Client connected on server: " + std::to_string(clientSock));
+
                 FD_SET(clientSock, &openSockets);
                 maxfds = std::max(maxfds, clientSock);
-                clients[clientSock] = "Group" + std::to_string(clientSock);
+                clients[clientSock] = "A5_" + std::to_string(clientSock);
+
+                // Saving Client information if its the first HELO message
+                char clientIP[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &(client.sin_addr), clientIP, INET_ADDRSTRLEN);
+                int clientPort = ntohs(client.sin_port);
+
+                logMessage("Client connected on server: " + std::to_string(clientSock) +
+                           " with IP: " + std::string(clientIP) +
+                           " and port: " + std::to_string(clientPort));
+
+                // Save the IP and port with the missing group name
+                std::string missing = "m";
+                ServerInfo newSocket = {missing, std::string(clientIP), clientPort};
+                oneHopServers[clientSock] = newSocket;
             }
 
             for (const auto &pair : clients)
