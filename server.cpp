@@ -194,27 +194,24 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
         std::string fromGroup = tokens[2];
         std::string messageContent = tokens[3];
 
-        for (size_t i = 4; i < tokens.size(); ++i)
-        {
+        for (size_t i = 4; i < tokens.size(); ++i) {
             messageContent += "," + tokens[i];
         }
 
-        auto serverIt = std::find_if(oneHopServers.begin(), oneHopServers.end(),
-                                     [&toGroup](const std::pair<int, ServerInfo> &server) {
-                                         return server.second.name == toGroup;
-                                     });
+        bool messageSent = false;
 
-        if (serverIt != oneHopServers.end())
-        {
-            // If the target group is connected to a one-hop server, send the message immediately
-            logMessage("Sending message immediately to " + toGroup + " via one-hop server.");
+        for (std::map<int, ServerInfo>::iterator it = oneHopServers.begin(); it != oneHopServers.end(); ++it) {
+            if (it->second.name == toGroup) {
+                logMessage("Sending message immediately to " + toGroup + " via one-hop server.");
 
-            std::string sendMsg = "SENDMSG," + toGroup + "," + fromGroup + "," + messageContent;
-            send(serverIt->first, sendMsg.c_str(), sendMsg.length(), 0);
+                std::string sendMsg = "SENDMSG," + toGroup + "," + fromGroup + "," + messageContent;
+                send(it->first, sendMsg.c_str(), sendMsg.length(), 0);
+                messageSent = true;
+                break; // Exit once the message is sent
+            }
         }
-        else
-        {
-            // Queue the message for the destination group if the server isn't found
+
+        if (!messageSent) {
             logMessage("Queueing message for " + toGroup);
             messageQueue[toGroup].push_back(command);
         }
@@ -319,16 +316,19 @@ void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
 // Function to connect to an instructor server and send a HELO message
 void connectToInstructorServers()
 {
-    std::vector<std::tuple<std::string, int, std::string>> instructorServers = {
-        {"Instr_1", 5001, "130.208.246.249"},
-        {"Instr_2", 5002, "130.208.246.249"},
-        {"Instr_3", 5003, "130.208.246.249"}};
+    std::vector<std::pair<std::string, std::pair<int, std::string>>> instructorServers = {
+        {"Instr_1", {5001, "130.208.246.249"}},
+        {"Instr_2", {5002, "130.208.246.249"}},
+        {"Instr_3", {5003, "130.208.246.249"}}
+    };
 
-    for (const auto &[name, port, ip] : instructorServers)
-    {
+    for (size_t i = 0; i < instructorServers.size(); ++i) {
+        const std::string &name = instructorServers[i].first;
+        int port = instructorServers[i].second.first;
+        const std::string &ip = instructorServers[i].second.second;
+
         int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0)
-        {
+        if (sock < 0) {
             perror("Failed to open socket for instructor server");
             continue;
         }
@@ -338,8 +338,7 @@ void connectToInstructorServers()
         inet_pton(AF_INET, ip.c_str(), &server.sin_addr);
         server.sin_port = htons(port);
 
-        if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0)
-        {
+        if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0) {
             perror("Failed to connect to instructor server");
             close(sock);
             continue;
@@ -356,17 +355,13 @@ void connectToInstructorServers()
         // Read response
         char buffer[1024];
         int bytesRead = recv(sock, buffer, sizeof(buffer) - 1, 0);
-        if (bytesRead > 0)
-        {
+        if (bytesRead > 0) {
             buffer[bytesRead] = '\0'; // Null-terminate the received data
             std::string response(buffer);
             ServerInfo newServer = {name, ip, port};
             oneHopServers[sock] = newServer; // Store server info
-            // logMessage("Received response from socket" + std::to_string(sock) + " : " + oneHopServers[sock].name);
-            logMessage("Received response from socket" + std::to_string(sock) + " : " + response);
-        }
-        else
-        {
+            logMessage("Received response from socket " + std::to_string(sock) + ": " + response);
+        } else {
             logMessage("Failed to receive response from " + name);
         }
     }
