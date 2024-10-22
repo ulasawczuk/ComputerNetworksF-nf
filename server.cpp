@@ -20,6 +20,7 @@
 #include <ctime>
 #include <string>
 #include <mutex>
+#include <vector>
 
 #define BACKLOG 5
 #define SOH 0x01
@@ -29,16 +30,18 @@
 
 // Global data structures
 std::map<int, std::string> clients;
-std::map<std::string, std::list<std::string> > messageQueue;
+std::map<std::string, std::list<std::string>> messageQueue;
 std::map<int, std::string> messageBuffer;
 std::mutex serverMutex;
 
 // Define a struct to hold server information
 struct ServerInfo
 {
-    std::string name; // Server name
-    std::string ip;   // IP address
-    int port;         // Port number
+    std::string name;                         // Server name
+    std::string ip;                           // IP address
+    int port;                                 // Port number
+    bool HELOSent;                            // Helo bool
+    std::vector<ServerInfo> connectedServers; // To hold connected server info
 
     // No constructer plese
 };
@@ -58,6 +61,44 @@ std::string getTimestamp()
 void logMessage(const std::string &msg)
 {
     std::cout << "[" << getTimestamp() << "] " << msg << std::endl;
+}
+
+std::string stripSOHEOT(std::string &data)
+{
+    // Process any complete messages (from SOH to EOT)
+    size_t startPos = data.find(SOH);
+    std::string completeMessage;
+
+    while (startPos != std::string::npos)
+    {
+        size_t endPos;
+        size_t potEndPos = data.find(EOT, startPos + 1);
+        if (potEndPos == std::string::npos)
+        {
+            break;
+        }
+        if (data[potEndPos - 1] != ESC)
+        {
+            endPos = potEndPos;
+        }
+
+        completeMessage = data.substr(startPos + 1, endPos - startPos - 1);
+        logMessage("Complete message received from client : " + completeMessage);
+        data = data.substr(endPos + 1);
+        startPos = data.find(SOH);
+    }
+    return completeMessage;
+}
+
+// Set timeout for socket
+void setSocketTimeout(int sock, int seconds)
+{
+    struct timeval timeout;
+    timeout.tv_sec = seconds;
+    timeout.tv_usec = 0;
+
+    // Set the receive timeout
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
 }
 
 // Open socket for specified port.
@@ -113,7 +154,7 @@ void sendKeepAlive()
         {
             int serverSock = server.first;
             std::string group = server.second.name; // Use the server name as the group ID
-            std::string keepAliveMessage = "KEEPALIVE," + group;
+            std::string keepAliveMessage = "\x01KEEPALIVE," + group + "\x04";
 
             logMessage("Sending KEEPALIVE message to server: " + group);
             send(serverSock, keepAliveMessage.c_str(), keepAliveMessage.length(), 0);
@@ -141,44 +182,156 @@ void closeClient(int clientSocket, fd_set *openSockets, int *maxfds)
     logMessage("Client connection closed: " + std::to_string(clientSocket));
 }
 
+void parseServerResponse(const std::vector<std::string> &tokens, std::vector<ServerInfo> &connectedServers)
+{
+    if (tokens[0] == "SERVERS")
+    {
+        // Start parsing from the second token onward (since the first token is "SERVERS")
+        for (size_t i = 1; i < tokens.size(); i += 3)
+        {
+            if (i + 2 < tokens.size()) // Ensure there are enough tokens to form a complete ServerInfo
+            {
+                std::string name = tokens[i];
+                std::string ip = tokens[i + 1];
+                int port = std::stoi(tokens[i + 2]);
+
+                // Add the parsed server info to the connectedServers vector
+                connectedServers.push_back({name, ip, port});
+            }
+        }
+        logMessage("Parse server response finished correctly");
+    }
+    else
+    {
+        std::cerr << "Invalid response format" << std::endl;
+    }
+    logMessage("Parse server response finished correctly");
+}
+
 // Process the completed message and handle commands from clients.
-void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const std::string &command)
+void processCommand(int clientSocket, const std::string &command)
 {
     std::vector<std::string> tokens;
     std::string token;
     std::stringstream stream(command);
 
-    // Split command from client into tokens for parsing
+    // // Split command from client into tokens for parsing
+    // while (std::getline(stream, token, ','))
+    // {
+    //     tokens.push_back(token);
+    //     // logMessage(token);
+    // }
+
     while (std::getline(stream, token, ','))
-        tokens.push_back(token);
+    {
+
+        // Check if the token contains a semicolon
+        size_t semicolonPos = token.find(';');
+        if (semicolonPos != std::string::npos)
+        {
+            // Split the token at the semicolon
+            std::string beforeSemicolon = token.substr(0, semicolonPos);
+            std::string afterSemicolon = token.substr(semicolonPos + 1);
+
+            // Add part before semicolon, if not empty
+            if (!beforeSemicolon.empty())
+            {
+                tokens.push_back(beforeSemicolon);
+                logMessage(beforeSemicolon);
+            }
+
+            // Insert a special marker for the semicolon
+            tokens.push_back("<SEMICOLON>");
+
+            // Add part after semicolon, if any
+            if (!afterSemicolon.empty())
+            {
+                tokens.push_back(afterSemicolon);
+            }
+        }
+        else
+        {
+            // If no semicolon, add the token directly
+            tokens.push_back(token);
+        }
+    }
 
     // Handle the commands from servers and clients
-    if (tokens[0].compare("HELO") == 0 && tokens.size() == 2)
+    if (tokens[0].compare("SERVERS") == 0)
+    {
+        std::vector<ServerInfo> connectedServers;
+
+        parseServerResponse(tokens, connectedServers);
+        oneHopServers[clientSocket].connectedServers = connectedServers;
+        std::string response;
+        for (const auto &server : connectedServers)
+        {
+            response += server.name + "," + server.ip + "," + std::to_string(server.port);
+        }
+        logMessage("This is what the server responed and what was saved " + response);
+    }
+    else if (tokens[0].compare("HELO") == 0 && tokens.size() == 2)
     {
         std::string fromGroup = tokens[1];
         clients[clientSocket] = fromGroup; // Register client with its group ID
 
         logMessage("HELO received from " + fromGroup);
 
+        // Save NAME of new SERVER connection
         if (oneHopServers[clientSocket].name.compare("m") == 0)
         {
             oneHopServers[clientSocket].name = fromGroup;
         }
+        // Answer with our own HELO message
+        if (!oneHopServers[clientSocket].HELOSent)
+        {
+            // Send HELO message
+            std::string ourGroup = "A5_12";
+            std::string helloMessage = "\x01HELO," + ourGroup + "\x04"; // Add SOT (0x02) at the start and EOT (0x04) at the end
 
+            send(clientSocket, helloMessage.c_str(), helloMessage.length(), 0);
+            logMessage("Sent HELO message to " + fromGroup);
+            oneHopServers[clientSocket].HELOSent = true;
+
+            // Read response
+            char buffer[5000];
+            logMessage("Before recieving");
+            int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+            std::string response(buffer);
+            logMessage("After recieving" + response);
+            // Reading the Servers
+            if (bytesRead > 0)
+            {
+                // buffer[bytesRead] = '\0'; // Null-terminate the received data
+                std::string response(buffer);
+
+                logMessage("Received response from socket " + std::to_string(clientSocket) + " :" + response);
+
+                std::string &data = messageBuffer[clientSocket];
+
+                std::string completeMessage = stripSOHEOT(data);
+                processCommand(clientSocket, completeMessage);
+            }
+            else
+            {
+                logMessage("Failed to receive response from " + oneHopServers[clientSocket].name);
+            }
+        }
         // Respond with SERVERS list
+        logMessage("Sending our connections to " + fromGroup);
         std::string response = "SERVERS,";
         response += fromGroup + "," + oneHopServers[clientSocket].ip + "," + std::to_string(oneHopServers[clientSocket].port);
 
         for (const auto &server : oneHopServers)
         {
-            logMessage("Going through list of size " + std::to_string(oneHopServers.size()));
 
             if (server.second.name != fromGroup) // Avoid repeating the sender
             {
                 response += ";" + server.second.name + "," + server.second.ip + "," + std::to_string(server.second.port);
             }
         }
-        send(clientSocket, response.c_str(), response.length(), 0);
+        std::string bufferedResponse = "\x01" + response + "\x04"; // Add SOT (0x02) at the start and EOT (0x04) at the end
+        send(clientSocket, bufferedResponse.c_str(), response.length(), 0);
     }
     else if (tokens[0].compare("KEEPALIVE") == 0 && tokens.size() == 2)
     {
@@ -186,7 +339,6 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
         int numMessages = std::stoi(tokens[1]);
 
         logMessage("KEEPALIVE received from client: " + fromGroup + ", No. of Messages: " + std::to_string(numMessages));
-
     }
     else if (tokens[0].compare("SENDMSG") == 0 && tokens.size() >= 4)
     {
@@ -194,14 +346,17 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
         std::string fromGroup = tokens[2];
         std::string messageContent = tokens[3];
 
-        for (size_t i = 4; i < tokens.size(); ++i) {
+        for (size_t i = 4; i < tokens.size(); ++i)
+        {
             messageContent += "," + tokens[i];
         }
 
         bool messageSent = false;
 
-        for (std::map<int, ServerInfo>::iterator it = oneHopServers.begin(); it != oneHopServers.end(); ++it) {
-            if (it->second.name == toGroup) {
+        for (std::map<int, ServerInfo>::iterator it = oneHopServers.begin(); it != oneHopServers.end(); ++it)
+        {
+            if (it->second.name == toGroup)
+            {
                 logMessage("Sending message immediately to " + toGroup + " via one-hop server.");
 
                 std::string sendMsg = "SENDMSG," + toGroup + "," + fromGroup + "," + messageContent;
@@ -211,7 +366,8 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
             }
         }
 
-        if (!messageSent) {
+        if (!messageSent)
+        {
             logMessage("Queueing message for " + toGroup);
             messageQueue[toGroup].push_back(command);
         }
@@ -231,11 +387,11 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
             // Send each message as a separate SENDMSG command
             while (!messageQueue[group].empty())
             {
-                std::string message = messageQueue[group].front();  // Get the next message
-                messageQueue[group].pop_front();                     // Remove it from the queue
+                std::string message = messageQueue[group].front(); // Get the next message
+                messageQueue[group].pop_front();                   // Remove it from the queue
 
                 logMessage("Sending message: " + message + " to client " + std::to_string(clientSocket));
-                send(clientSocket, message.c_str(), message.length(), 0);  // Send the original SENDMSG command
+                send(clientSocket, message.c_str(), message.length(), 0); // Send the original SENDMSG command
             }
         }
         else
@@ -272,13 +428,13 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
 // Read incoming data and accumulate it until a full message is received
 void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
 {
-    char buffer[1024];
+    char buffer[5000];
     int bytes = recv(clientSocket, buffer, sizeof(buffer), 0);
 
     if (bytes <= 0)
     {
         logMessage("Client " + std::to_string(clientSocket) + " disconnected or recv() failed.");
-        // closeClient(clientSocket, openSockets, maxfds);
+        closeClient(clientSocket, openSockets, maxfds);
         return;
     }
 
@@ -289,45 +445,28 @@ void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
 
     // Process any complete messages (from SOH to EOT)
     std::string &clientData = messageBuffer[clientSocket];
-    size_t startPos = clientData.find(SOH);
 
-    while (startPos != std::string::npos)
-    {
-        size_t endPos;
-        size_t potEndPos = clientData.find(EOT, startPos + 1);
-        if (potEndPos == std::string::npos)
-        {
-            break;
-        }
-        if (clientData[potEndPos - 1] != ESC)
-        {
-            endPos = potEndPos;
-        }
-
-        std::string completeMessage = clientData.substr(startPos + 1, endPos - startPos - 1);
-        logMessage("Complete message received from client " + std::to_string(clientSocket) + ": " + completeMessage);
-
-        processCommand(clientSocket, openSockets, maxfds, completeMessage);
-        clientData = clientData.substr(endPos + 1);
-        startPos = clientData.find(SOH);
-    }
+    std::string completeMessage = stripSOHEOT(clientData);
+    processCommand(clientSocket, completeMessage);
 }
 
 // Function to connect to an instructor server and send a HELO message
 void connectToInstructorServers()
 {
-    std::vector<std::pair<std::string, std::pair<int, std::string> > > instructorServers;
+    std::vector<std::pair<std::string, std::pair<int, std::string>>> instructorServers;
     instructorServers.push_back(std::make_pair("Instr_1", std::make_pair(5001, "130.208.246.249")));
     instructorServers.push_back(std::make_pair("Instr_2", std::make_pair(5002, "130.208.246.249")));
     instructorServers.push_back(std::make_pair("Instr_3", std::make_pair(5003, "130.208.246.249")));
 
-    for (size_t i = 0; i < instructorServers.size(); ++i) {
+    for (size_t i = 0; i < instructorServers.size(); ++i)
+    {
         const std::string &name = instructorServers[i].first;
         int port = instructorServers[i].second.first;
         const std::string &ip = instructorServers[i].second.second;
 
         int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) {
+        if (sock < 0)
+        {
             perror("Failed to open socket for instructor server");
             continue;
         }
@@ -337,7 +476,8 @@ void connectToInstructorServers()
         inet_pton(AF_INET, ip.c_str(), &server.sin_addr);
         server.sin_port = htons(port);
 
-        if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0) {
+        if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0)
+        {
             perror("Failed to connect to instructor server");
             close(sock);
             continue;
@@ -347,21 +487,112 @@ void connectToInstructorServers()
 
         // Send HELO message
         std::string fromGroup = "A5_12";
-        std::string helloMessage = "HELO," + fromGroup;
+        std::string helloMessage = "\x01HELO," + fromGroup + "\x04";
         send(sock, helloMessage.c_str(), helloMessage.length(), 0);
         logMessage("Sent HELO message to " + name);
 
-        // Read response
-        char buffer[1024];
+        char buffer[5000];
         int bytesRead = recv(sock, buffer, sizeof(buffer) - 1, 0);
-        if (bytesRead > 0) {
+        if (bytesRead > 0)
+        {
             buffer[bytesRead] = '\0'; // Null-terminate the received data
             std::string response(buffer);
-            ServerInfo newServer = {name, ip, port};
-            oneHopServers[sock] = newServer; // Store server info
-            logMessage("Received response from socket " + std::to_string(sock) + ": " + response);
-        } else {
-            logMessage("Failed to receive response from " + name);
+            logMessage("Received response from port " + std::to_string(port) + ": " + response);
+
+            // Extract the complete message
+            std::string completeMessage = stripSOHEOT(response);
+
+            ServerInfo newServer = {name, ip, port, true};
+            oneHopServers[sock] = newServer;
+
+            // Process the complete message
+            processCommand(sock, completeMessage);
+        }
+    }
+}
+
+// Scanning 220 port for servers that are listening
+void scanPorts(int omittedPort)
+{
+    const int startPort = 4000;
+    const int endPort = 4200;
+
+    for (int port = startPort; port <= endPort; ++port)
+    {
+
+        if (port == omittedPort)
+        {
+            logMessage("Omitting port: " + std::to_string(port));
+            continue;
+        }
+
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0)
+        {
+            perror("Failed to open socket for scanning");
+            continue;
+        }
+
+        sockaddr_in server;
+        server.sin_family = AF_INET;
+        server.sin_addr.s_addr = INADDR_ANY; // Scan the local server
+        server.sin_port = htons(port);
+
+        // Set the timeout for the socket
+        setSocketTimeout(sock, 3);
+
+        // Attempt to connect to the server
+        if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0)
+        {
+            // Connection failed, move to the next port
+            close(sock);
+            continue;
+        }
+
+        logMessage("Connected to local server on port: " + std::to_string(port));
+
+        // Send HELO message
+        std::string fromGroup = "A5_12"; // Adjust group name as necessary
+        std::string helloMessage = "\x01HELO," + fromGroup + "\x04";
+        send(sock, helloMessage.c_str(), helloMessage.length(), 0);
+        logMessage("Sent HELO message to port: " + std::to_string(port));
+
+        // Read response
+        char buffer[5000];
+        int bytesRead = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (bytesRead > 0)
+        {
+            buffer[bytesRead] = '\0'; // Null-terminate the received data
+            std::string response(buffer);
+            logMessage("Received response from port " + std::to_string(port) + ": " + response);
+
+            sockaddr_in peerAddr;
+            socklen_t peerAddrLen = sizeof(peerAddr);
+            if (getpeername(sock, (struct sockaddr *)&peerAddr, &peerAddrLen) == 0)
+            {
+                char connectingServerIP[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &peerAddr.sin_addr, connectingServerIP, INET_ADDRSTRLEN);
+                int connectingServerPort = ntohs(peerAddr.sin_port);
+
+                // Create a new ServerInfo and add it to oneHopServers
+                std::string missing = "m";
+                ServerInfo newServer = {missing, std::string(connectingServerIP), connectingServerPort, true};
+                oneHopServers[sock] = newServer;
+            }
+            else
+            {
+                perror("getpeername failed");
+            }
+
+            // Extract the complete message
+            std::string completeMessage = stripSOHEOT(response);
+
+            // Process the complete message
+            processCommand(sock, completeMessage);
+        }
+        else
+        {
+            logMessage("No response or connection failed on port: " + std::to_string(port));
         }
     }
 }
@@ -382,6 +613,7 @@ int main(int argc, char *argv[])
         exit(0);
     }
 
+    int serverPort = atoi(argv[1]);
     logMessage("Starting chat server...");
 
     listenSock = open_socket(atoi(argv[1]));
@@ -411,6 +643,8 @@ int main(int argc, char *argv[])
 
     std::thread keepAliveThread(sendKeepAlive);
     keepAliveThread.detach(); // Detach the thread so it runs independently
+
+    scanPorts(serverPort);
 
     logMessage("Waiting for connections...");
 
