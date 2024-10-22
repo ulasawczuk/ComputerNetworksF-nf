@@ -29,7 +29,7 @@
 
 // Global data structures
 std::map<int, std::string> clients;
-std::map<std::string, std::list<std::string>> messageQueue;
+std::map<std::string, std::list<std::string> > messageQueue;
 std::map<int, std::string> messageBuffer;
 std::mutex serverMutex;
 
@@ -52,25 +52,6 @@ std::string getTimestamp()
     char buffer[100];
     strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", localtime(&now));
     return std::string(buffer);
-}
-
-void sendKeepAlive()
-{
-    while (true)
-    {
-        std::this_thread::sleep_for(std::chrono::minutes(1)); // Wait for 1 minute
-
-        std::lock_guard<std::mutex> lock(serverMutex); // Lock the mutex for safe access
-        for (const auto &server : oneHopServers)
-        {
-            int serverSock = server.first;
-            std::string group = server.second.name; // Use the server name as the group ID
-            std::string keepAliveMessage = "KEEPALIVE," + group;
-
-            logMessage("Sending KEEPALIVE message to server: " + group);
-            send(serverSock, keepAliveMessage.c_str(), keepAliveMessage.length(), 0);
-        }
-    }
 }
 
 // Log the messages with timestamps
@@ -119,6 +100,25 @@ int open_socket(int portno)
     logMessage("Socket bound to port " + std::to_string(portno) + " successfully.");
 
     return sock;
+}
+
+void sendKeepAlive()
+{
+    while (true)
+    {
+        std::this_thread::sleep_for(std::chrono::minutes(1)); // Wait for 1 minute
+
+        std::lock_guard<std::mutex> lock(serverMutex); // Lock the mutex for safe access
+        for (const auto &server : oneHopServers)
+        {
+            int serverSock = server.first;
+            std::string group = server.second.name; // Use the server name as the group ID
+            std::string keepAliveMessage = "KEEPALIVE," + group;
+
+            logMessage("Sending KEEPALIVE message to server: " + group);
+            send(serverSock, keepAliveMessage.c_str(), keepAliveMessage.length(), 0);
+        }
+    }
 }
 
 // Close a client's connection, remove from the client list, and tidy up select sockets afterwards.
