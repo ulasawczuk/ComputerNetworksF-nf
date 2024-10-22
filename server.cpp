@@ -316,7 +316,7 @@ void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
 // Function to connect to an instructor server and send a HELO message
 void connectToInstructorServers()
 {
-    std::vector<std::pair<std::string, std::pair<int, std::string>>> instructorServers = {
+    std::vector<std::pair<std::string, std::pair<int, std::string>> > instructorServers = {
         {"Instr_1", {5001, "130.208.246.249"}},
         {"Instr_2", {5002, "130.208.246.249"}},
         {"Instr_3", {5003, "130.208.246.249"}}
