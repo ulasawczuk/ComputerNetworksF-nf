@@ -19,6 +19,7 @@
 #include <thread>
 #include <ctime>
 #include <string>
+#include <mutex>
 
 #define BACKLOG 5
 #define SOH 0x01
@@ -30,7 +31,7 @@
 std::map<int, std::string> clients;
 std::map<std::string, std::list<std::string>> messageQueue;
 std::map<int, std::string> messageBuffer;
-std::map<std::string, std::pair<std::string, int>> oneHopServerse;
+std::mutex serverMutex;
 
 // Define a struct to hold server information
 struct ServerInfo
@@ -43,6 +44,7 @@ struct ServerInfo
 };
 
 std::map<int, ServerInfo> oneHopServers;
+
 // Utility function to get the current timestamp as a string
 std::string getTimestamp()
 {
@@ -50,6 +52,25 @@ std::string getTimestamp()
     char buffer[100];
     strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", localtime(&now));
     return std::string(buffer);
+}
+
+void sendKeepAlive()
+{
+    while (true)
+    {
+        std::this_thread::sleep_for(std::chrono::minutes(1)); // Wait for 1 minute
+
+        std::lock_guard<std::mutex> lock(serverMutex); // Lock the mutex for safe access
+        for (const auto &server : oneHopServers)
+        {
+            int serverSock = server.first;
+            std::string group = server.second.name; // Use the server name as the group ID
+            std::string keepAliveMessage = "KEEPALIVE," + group;
+
+            logMessage("Sending KEEPALIVE message to server: " + group);
+            send(serverSock, keepAliveMessage.c_str(), keepAliveMessage.length(), 0);
+        }
+    }
 }
 
 // Log the messages with timestamps
@@ -166,7 +187,6 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
 
         logMessage("KEEPALIVE received from client: " + fromGroup + ", No. of Messages: " + std::to_string(numMessages));
 
-        // Handle keepalive logic if needed, e.g., updating a timestamp for the client
     }
     else if (tokens[0].compare("SENDMSG") == 0 && tokens.size() >= 4)
     {
@@ -179,10 +199,25 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
             messageContent += "," + tokens[i];
         }
 
-        logMessage("Message from " + fromGroup + " to " + toGroup + ": " + messageContent);
+        auto serverIt = std::find_if(oneHopServers.begin(), oneHopServers.end(),
+                                     [&toGroup](const std::pair<int, ServerInfo> &server) {
+                                         return server.second.name == toGroup;
+                                     });
 
-        // Queue the message for the destination group
-        messageQueue[toGroup].push_back(fromGroup + ": " + messageContent);
+        if (serverIt != oneHopServers.end())
+        {
+            // If the target group is connected to a one-hop server, send the message immediately
+            logMessage("Sending message immediately to " + toGroup + " via one-hop server.");
+
+            std::string sendMsg = "SENDMSG," + toGroup + "," + fromGroup + "," + messageContent;
+            send(serverIt->first, sendMsg.c_str(), sendMsg.length(), 0);
+        }
+        else
+        {
+            // Queue the message for the destination group if the server isn't found
+            logMessage("Queueing message for " + toGroup);
+            messageQueue[toGroup].push_back(command);
+        }
 
         // Acknowledge the message was received
         std::string ack = "Message sent to " + toGroup;
@@ -191,12 +226,20 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
     else if (tokens[0].compare("GETMSGS") == 0 && tokens.size() == 2)
     {
         std::string group = tokens[1];
+        logMessage("GETMSGS request for group: " + group);
+
+        // Check if there are messages in the queue for the specified group
         if (!messageQueue[group].empty())
         {
-            // Retrieve the next message for the group
-            std::string message = messageQueue[group].front();
-            // messageQueue[group].pop_front();
-            send(clientSocket, message.c_str(), message.length(), 0);
+            // Send each message as a separate SENDMSG command
+            while (!messageQueue[group].empty())
+            {
+                std::string message = messageQueue[group].front();  // Get the next message
+                messageQueue[group].pop_front();                     // Remove it from the queue
+
+                logMessage("Sending message: " + message + " to client " + std::to_string(clientSocket));
+                send(clientSocket, message.c_str(), message.length(), 0);  // Send the original SENDMSG command
+            }
         }
         else
         {
@@ -210,10 +253,17 @@ void processCommand(int clientSocket, fd_set *openSockets, int *maxfds, const st
 
         // Generate the STATUSRESP message
         std::string response = "STATUSRESP";
-        for (const auto &queue : messageQueue)
+        for (const auto &server : oneHopServers)
         {
-            response += "," + queue.first + "," + std::to_string(queue.second.size());
+            const auto &serverInfo = server.second;
+            std::string serverName = serverInfo.name;
+
+            // Count the messages for the server's group name
+            int messagesHeld = messageQueue[serverName].size();
+
+            response += "," + serverName + "," + std::to_string(messagesHeld);
         }
+
         send(clientSocket, response.c_str(), response.length(), 0);
     }
     else
@@ -310,8 +360,8 @@ void connectToInstructorServers()
         {
             buffer[bytesRead] = '\0'; // Null-terminate the received data
             std::string response(buffer);
-            ServerInfo newSocket = {name, ip, port};
-            oneHopServers[sock] = newSocket; // Store server info
+            ServerInfo newServer = {name, ip, port};
+            oneHopServers[sock] = newServer; // Store server info
             // logMessage("Received response from socket" + std::to_string(sock) + " : " + oneHopServers[sock].name);
             logMessage("Received response from socket" + std::to_string(sock) + " : " + response);
         }
@@ -365,6 +415,9 @@ int main(int argc, char *argv[])
 
     std::cout << "DONE CONNECTING TO INSTUCTORS SERVERS" << std::endl;
 
+    std::thread keepAliveThread(sendKeepAlive);
+    keepAliveThread.detach(); // Detach the thread so it runs independently
+
     logMessage("Waiting for connections...");
 
     while (!finished)
@@ -403,8 +456,8 @@ int main(int argc, char *argv[])
 
                 // Save the IP and port with the missing group name
                 std::string missing = "m";
-                ServerInfo newSocket = {missing, std::string(clientIP), clientPort};
-                oneHopServers[clientSock] = newSocket;
+                ServerInfo newServer = {missing, std::string(clientIP), clientPort};
+                oneHopServers[clientSock] = newServer;
             }
 
             for (const auto &pair : clients)
