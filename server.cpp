@@ -316,11 +316,10 @@ void readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
 // Function to connect to an instructor server and send a HELO message
 void connectToInstructorServers()
 {
-    std::vector<std::pair<std::string, std::pair<int, std::string> > > instructorServers = {
-        {"Instr_1", {5001, "130.208.246.249"}},
-        {"Instr_2", {5002, "130.208.246.249"}},
-        {"Instr_3", {5003, "130.208.246.249"}}
-    };
+    std::vector<std::pair<std::string, std::pair<int, std::string>>> instructorServers;
+    instructorServers.push_back(std::make_pair("Instr_1", std::make_pair(5001, "130.208.246.249")));
+    instructorServers.push_back(std::make_pair("Instr_2", std::make_pair(5002, "130.208.246.249")));
+    instructorServers.push_back(std::make_pair("Instr_3", std::make_pair(5003, "130.208.246.249")));
 
     for (size_t i = 0; i < instructorServers.size(); ++i) {
         const std::string &name = instructorServers[i].first;
