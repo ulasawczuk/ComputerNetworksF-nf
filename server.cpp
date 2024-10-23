@@ -226,7 +226,6 @@ void sendKeepAlive()
 // Close a client's connection, remove from the client list, and tidy up select sockets afterwards.
 void closeClient(int clientSocket, fd_set *openSockets, int *maxfds)
 {
-    logMessage("Closing client connection: " + std::to_string(clientSocket));
     close(clientSocket);
 
     if (*maxfds == clientSocket)
@@ -254,7 +253,6 @@ void parseServerResponse(const std::vector<std::string> &tokens, std::vector<Ser
             std::string name = tokens[i];
             std::string ip = tokens[i + 1];
             std::string portStr = tokens[i + 2];
-            std::cout << "i; " << i << std::endl;
 
             if (name == "<SEMICOLON>")
             {
@@ -345,7 +343,6 @@ void processCommand(int clientSocket, const std::string &command)
     // Handle the commands from servers and clients
     if (tokens[0].compare("SERVERS") == 0 || tokens[0].compare("LISTSERVERS") == 0)
     {
-        logMessage("Servers are starting proccessed");
         std::vector<ServerInfo> connectedServers;
 
         parseServerResponse(tokens, connectedServers);
@@ -355,7 +352,6 @@ void processCommand(int clientSocket, const std::string &command)
         {
             response += server.name + "," + server.ip + "," + std::to_string(server.port);
         }
-        logMessage("This is what the server responed and what was saved " + response);
     }
     else if (tokens[0].compare("HELO") == 0 && tokens.size() == 2)
     {
@@ -417,7 +413,7 @@ void processCommand(int clientSocket, const std::string &command)
         }
         std::string bufferedResponse = "\x01" + response + "\x04"; // Add SOT (0x02) at the start and EOT (0x04) at the end
         send(clientSocket, bufferedResponse.c_str(), bufferedResponse.length(), 0);
-        logMessage("Our serverconnections got sent");
+        // logMessage("Our serverconnections got sent");
     }
     else if (tokens[0].compare("KEEPALIVE") == 0 && tokens.size() == 2)
     {
@@ -441,7 +437,7 @@ void processCommand(int clientSocket, const std::string &command)
             {
                 logMessage("Sending message immediately to " + toGroup + " via one-hop server.");
 
-                std::string sendMsg = "\x01" + command + "\x04";
+                std::string sendMsg = "\x01" + messageContent + "\x04";
                 send(it->first, sendMsg.c_str(), sendMsg.length(), 0);
                 messageSent = true;
                 break;
@@ -579,7 +575,7 @@ void connectToInstructorServers()
         {
             buffer[bytesRead] = '\0'; // Null-terminate the received data
             std::string response(buffer);
-            logMessage("Received response from port " + std::to_string(port) + ": " + response);
+            // logMessage("Received response from port " + std::to_string(port) + ": " + response);
 
             ServerInfo newServer = {name, ip, port, true};
             oneHopServers[sock] = newServer;
@@ -638,7 +634,7 @@ void scanPorts(int omittedPort)
         std::string fromGroup = "A5_12"; // Adjust group name as necessary
         std::string helloMessage = "\x01HELO," + fromGroup + "\x04";
         send(sock, helloMessage.c_str(), helloMessage.length(), 0);
-        logMessage("Sent HELO message to port: " + std::to_string(port));
+        // logMessage("Sent HELO message to port: " + std::to_string(port));
 
         // Read response
         char buffer[5000];
@@ -647,7 +643,7 @@ void scanPorts(int omittedPort)
         {
             buffer[bytesRead] = '\0'; // Null-terminate the received data
             std::string response(buffer);
-            logMessage("Received response from port " + std::to_string(port) + ": " + response);
+            // logMessage("Received response from port " + std::to_string(port) + ": " + response);
 
             sockaddr_in peerAddr;
             socklen_t peerAddrLen = sizeof(peerAddr);
@@ -686,7 +682,7 @@ void scanPorts(int omittedPort)
         {
             buffer[bytesRead2] = '\0'; // Null-terminate the received data
             std::string response(buffer2);
-            logMessage("Received response from port " + std::to_string(port) + ": " + response);
+            // logMessage("Received response from port " + std::to_string(port) + ": " + response);
 
             // Extract the complete message
             std::list<std::string> completeMessages = stripSOHEOT(response);
@@ -807,7 +803,15 @@ int main(int argc, char *argv[])
                     }
                     else
                     {
-                        logMessage("Data got read");
+                        logMessage("Data was read");
+                    }
+                }
+
+                if (messageQueue[server.second.name].size() > 0)
+                {
+                    for (std::string message : messageQueue[server.second.name])
+                    {
+                        processCommand(server.first, message);
                     }
                 }
             }
@@ -816,9 +820,8 @@ int main(int argc, char *argv[])
             for (int clientSock : serversToDelete)
             {
                 oneHopServers.erase(clientSock); // Safely remove after iteration
-                logMessage("Removed disconnected server: " + std::to_string(clientSock));
             }
-            printOneHopServers();
+            // printOneHopServers();
         }
     }
 
