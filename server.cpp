@@ -21,6 +21,8 @@
 #include <string>
 #include <mutex>
 #include <vector>
+#include <variant>
+#include <signal.h>
 
 #define BACKLOG 5
 #define SOH 0x01
@@ -99,13 +101,14 @@ void logMessage(const std::string &msg)
     std::cout << "[" << getTimestamp() << "] " << msg << std::endl;
 }
 
-std::string stripSOHEOT(std::string &data)
+std::list<std::string> stripSOHEOT(std::string &data)
 {
     std::string completeMessage;
 
     // Check if there is no SOH and no EOT in the data
     size_t startPos = data.find(SOH);
     size_t endPos = data.find(EOT);
+    std::list<std::string> messages;
 
     // If neither SOH nor EOT is found, return the entire string
     if (startPos == std::string::npos && endPos == std::string::npos)
@@ -113,7 +116,8 @@ std::string stripSOHEOT(std::string &data)
         completeMessage = data;
         data.clear(); // Clear the data as it has been fully processed
         logMessage("Complete message received from client (no SOH/EOT): " + completeMessage);
-        return completeMessage;
+        messages.push_back(completeMessage);
+        return messages;
     }
 
     // Process any complete messages (from SOH to EOT)
@@ -132,6 +136,7 @@ std::string stripSOHEOT(std::string &data)
 
         completeMessage = data.substr(startPos + 1, endPos - startPos - 1);
         logMessage("Complete message received from client: " + completeMessage);
+        messages.push_back(completeMessage);
 
         // Remove the processed message from the data
         data = data.substr(endPos + 1);
@@ -140,7 +145,8 @@ std::string stripSOHEOT(std::string &data)
         startPos = data.find(SOH);
     }
 
-    return completeMessage;
+    // Otherwise, return the entire list of messages
+    return messages;
 }
 
 // Set timeout for socket
@@ -200,7 +206,7 @@ void sendKeepAlive()
 {
     while (true)
     {
-        std::this_thread::sleep_for(std::chrono::minutes(1)); // Wait for 1 minute
+        std::this_thread::sleep_for(std::chrono::minutes(5)); // Wait for 1 minute
 
         std::lock_guard<std::mutex> lock(serverMutex); // Lock the mutex for safe access
         for (const auto &server : oneHopServers)
@@ -212,7 +218,7 @@ void sendKeepAlive()
 
             logMessage("Sending KEEPALIVE message to server: " + group);
             send(serverSock, keepAliveMessage.c_str(), keepAliveMessage.length(), 0);
-            logMessage("Confirming that message has been sent");
+            // logMessage("Confirming that message has been sent");
         }
     }
 }
@@ -240,15 +246,42 @@ void closeClient(int clientSocket, fd_set *openSockets, int *maxfds)
 
 void parseServerResponse(const std::vector<std::string> &tokens, std::vector<ServerInfo> &connectedServers)
 {
-    if (tokens[0] == "SERVERS")
+    if (tokens[0] == "SERVERS" || tokens[0] == "LISTSERVERS")
     {
         // Start parsing from the second token onward (since the first token is "SERVERS")
-        for (size_t i = 1; i < tokens.size(); i += 4)
+        for (int i = 1; i < tokens.size(); i += 4)
         {
-            if (i + 2 < tokens.size()) // Ensure there are enough tokens to form a complete ServerInfo
+            std::string name = tokens[i];
+            std::string ip = tokens[i + 1];
+            std::string portStr = tokens[i + 2];
+            std::cout << "i; " << i << std::endl;
+
+            if (name == "<SEMICOLON>")
+            {
+                logMessage(name + ip + portStr);
+                i -= 1;
+                logMessage("Skipping misaligned server info due to semicolon token.");
+                continue;
+            }
+            if (ip == "<SEMICOLON>")
+            {
+                i -= 2;
+                logMessage(name + ip + portStr);
+                logMessage("Skipping misaligned server info due to semicolon token.");
+                continue;
+            }
+            if (portStr == "<SEMICOLON>")
+            {
+                i -= 3;
+                logMessage(name + ip + portStr);
+                logMessage("Skipping misaligned server info due to semicolon token.");
+                continue; // Skip this set of tokens
+            }
+            if (i + 3 < tokens.size()) // Ensure there are enough tokens to form a complete ServerInfo
             {
                 std::string name = tokens[i];
                 std::string ip = tokens[i + 1];
+                // logMessage(name + ip);
                 int port = std::stoi(tokens[i + 2]);
 
                 // Add the parsed server info to the connectedServers vector
@@ -310,7 +343,7 @@ void processCommand(int clientSocket, const std::string &command)
     }
 
     // Handle the commands from servers and clients
-    if (tokens[0].compare("SERVERS") == 0)
+    if (tokens[0].compare("SERVERS") == 0 || tokens[0].compare("LISTSERVERS") == 0)
     {
         logMessage("Servers are starting proccessed");
         std::vector<ServerInfo> connectedServers;
@@ -358,8 +391,11 @@ void processCommand(int clientSocket, const std::string &command)
 
                 logMessage("Received response from socket " + std::to_string(clientSocket) + " :" + response);
 
-                std::string completeMessage = stripSOHEOT(response);
-                processCommand(clientSocket, completeMessage);
+                std::list<std::string> completeMessages = stripSOHEOT(response);
+                for (const std::string &message : completeMessages)
+                {
+                    processCommand(clientSocket, message);
+                }
             }
             else
             {
@@ -392,14 +428,10 @@ void processCommand(int clientSocket, const std::string &command)
     }
     else if (tokens[0].compare("SENDMSG") == 0 && tokens.size() >= 4)
     {
+
         std::string toGroup = tokens[1];
         std::string fromGroup = tokens[2];
         std::string messageContent = tokens[3];
-
-        for (size_t i = 4; i < tokens.size(); ++i)
-        {
-            messageContent += "," + tokens[i];
-        }
 
         bool messageSent = false;
 
@@ -409,10 +441,10 @@ void processCommand(int clientSocket, const std::string &command)
             {
                 logMessage("Sending message immediately to " + toGroup + " via one-hop server.");
 
-                std::string sendMsg = "SENDMSG," + toGroup + "," + fromGroup + "," + messageContent;
+                std::string sendMsg = "\x01" + command + "\x04";
                 send(it->first, sendMsg.c_str(), sendMsg.length(), 0);
                 messageSent = true;
-                break; // Exit once the message is sent
+                break;
             }
         }
 
@@ -426,7 +458,7 @@ void processCommand(int clientSocket, const std::string &command)
         std::string ack = "Message sent to " + toGroup;
         send(clientSocket, ack.c_str(), ack.length(), 0);
     }
-    else if (tokens[0].compare("GETMSGS") == 0 && tokens.size() == 2)
+    else if (tokens[0].compare("GETMSGS") == 0 && tokens.size() == 2 || tokens[0].compare("GETMSG") == 0 && tokens.size() == 2)
     {
         std::string group = tokens[1];
         logMessage("GETMSGS request for group: " + group);
@@ -491,8 +523,11 @@ int readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
     // Accumulate received data into the buffer for this client
     logMessage("Received " + std::to_string(bytes) + " bytes from client " + std::to_string(clientSocket));
 
-    std::string completeMessage = stripSOHEOT(response);
-    processCommand(clientSocket, completeMessage);
+    std::list<std::string> completeMessages = stripSOHEOT(response);
+    for (const std::string &message : completeMessages)
+    {
+        processCommand(clientSocket, message);
+    }
 
     return 0;
 }
@@ -546,14 +581,15 @@ void connectToInstructorServers()
             std::string response(buffer);
             logMessage("Received response from port " + std::to_string(port) + ": " + response);
 
-            // Extract the complete message
-            std::string completeMessage = stripSOHEOT(response);
-
             ServerInfo newServer = {name, ip, port, true};
             oneHopServers[sock] = newServer;
 
-            // Process the complete message
-            processCommand(sock, completeMessage);
+            // Extract the complete message
+            std::list<std::string> completeMessages = stripSOHEOT(response);
+            for (const std::string &message : completeMessages)
+            {
+                processCommand(sock, message);
+            }
         }
     }
 }
@@ -562,7 +598,7 @@ void connectToInstructorServers()
 void scanPorts(int omittedPort)
 {
     const int startPort = 4000;
-    const int endPort = 4200;
+    const int endPort = 4010;
 
     for (int port = startPort; port <= endPort; ++port)
     {
@@ -586,7 +622,7 @@ void scanPorts(int omittedPort)
         server.sin_port = htons(port);
 
         // Set the timeout for the socket
-        setSocketTimeout(sock, 3);
+        setSocketTimeout(sock, 1);
 
         // Attempt to connect to the server
         if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0)
@@ -632,10 +668,11 @@ void scanPorts(int omittedPort)
             }
 
             // Extract the complete message
-            std::string completeMessage = stripSOHEOT(response);
-
-            // Process the complete message
-            processCommand(sock, completeMessage);
+            std::list<std::string> completeMessages = stripSOHEOT(response);
+            for (const std::string &message : completeMessages)
+            {
+                processCommand(sock, message);
+            }
         }
         else
         {
@@ -652,10 +689,11 @@ void scanPorts(int omittedPort)
             logMessage("Received response from port " + std::to_string(port) + ": " + response);
 
             // Extract the complete message
-            std::string completeMessage = stripSOHEOT(response);
-
-            // Process the complete message
-            processCommand(sock, completeMessage);
+            std::list<std::string> completeMessages = stripSOHEOT(response);
+            for (const std::string &message : completeMessages)
+            {
+                processCommand(sock, message);
+            }
         }
     }
 }
@@ -697,6 +735,7 @@ int main(int argc, char *argv[])
     FD_ZERO(&openSockets);
     FD_SET(listenSock, &openSockets);
     maxfds = listenSock;
+    signal(SIGPIPE, SIG_IGN);
 
     std::cout << "CONNECTING TO INSTUCTORS SERVERS" << std::endl;
     // Connect to specified instructor servers and send HELO messages
