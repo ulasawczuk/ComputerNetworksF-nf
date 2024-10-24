@@ -101,6 +101,7 @@ void logMessage(const std::string &msg)
     std::cout << "[" << getTimestamp() << "] " << msg << std::endl;
 }
 
+// Handling SOH and EOT at the begging and end of message
 std::list<std::string> stripSOHEOT(std::string &data)
 {
     std::string completeMessage;
@@ -202,17 +203,18 @@ int open_socket(int portno)
     return sock;
 }
 
+// Thread to send KEEPALIVE packets
 void sendKeepAlive()
 {
     while (true)
     {
-        std::this_thread::sleep_for(std::chrono::minutes(5)); // Wait for 1 minute
+        std::this_thread::sleep_for(std::chrono::minutes(1)); // wait for 1 minute
 
-        std::lock_guard<std::mutex> lock(serverMutex); // Lock the mutex for safe access
+        std::lock_guard<std::mutex> lock(serverMutex); // locking the mutex
         for (const auto &server : oneHopServers)
         {
             int serverSock = server.first;
-            std::string group = server.second.name; // Use the server name as the group ID
+            std::string group = server.second.name;
             int numMessages = messageQueue[group].size();
             std::string keepAliveMessage = "\x01KEEPALIVE," + std::to_string(numMessages) + "\x04";
 
@@ -222,6 +224,7 @@ void sendKeepAlive()
         }
     }
 }
+
 
 // Close a client's connection, remove from the client list, and tidy up select sockets afterwards.
 void closeClient(int clientSocket, fd_set *openSockets, int *maxfds)
@@ -299,6 +302,7 @@ void processCommand(int clientSocket, const std::string &command)
     std::vector<std::string> tokens;
     std::string token;
     std::stringstream stream(command);
+    std::string ourGroup = "A5_12";
 
     // // Split command from client into tokens for parsing
     // while (std::getline(stream, token, ','))
@@ -368,7 +372,6 @@ void processCommand(int clientSocket, const std::string &command)
         if (!oneHopServers[clientSocket].HELOSent)
         {
             // Send HELO message
-            std::string ourGroup = "A5_12";
             std::string helloMessage = "\x01HELO," + ourGroup + "\x04"; // Add SOT (0x02) at the start and EOT (0x04) at the end
 
             send(clientSocket, helloMessage.c_str(), helloMessage.length(), 0);
@@ -465,11 +468,11 @@ void processCommand(int clientSocket, const std::string &command)
             // Send each message as a separate SENDMSG command
             while (!messageQueue[group].empty())
             {
-                std::string message = messageQueue[group].front(); // Get the next message
-                messageQueue[group].pop_front();                   // Remove it from the queue
+                std::string message = messageQueue[group].front(); 
+                messageQueue[group].pop_front();                   
 
                 logMessage("Sending message: " + message + " to client " + std::to_string(clientSocket));
-                send(clientSocket, message.c_str(), message.length(), 0); // Send the original SENDMSG command
+                send(clientSocket, message.c_str(), message.length(), 0); // sending the original SENDMSG command
             }
         }
         else
@@ -494,7 +497,130 @@ void processCommand(int clientSocket, const std::string &command)
             response += "," + serverName + "," + std::to_string(messagesHeld);
         }
 
-        (clientSocket, response.c_str(), response.length(), 0);
+        send(clientSocket, response.c_str(), response.length(), 0);
+    }
+    else if (tokens[0].compare("STATUSRESP") == 0)
+    {
+            
+        logMessage("Processing STATUSRESP command.");
+
+        for (size_t i = 1; i < tokens.size(); i += 2)
+        {
+            std::string serverName = tokens[i];     
+            int numMessages = std::stoi(tokens[i + 1]);
+
+            // Messages for us:DDD
+            if (serverName == ourGroup)
+            {
+                logMessage("There are " + std::to_string(numMessages) + " for us! ");
+
+                // Send GETMSG command to request those messages
+                std::string getMsgCommand = "\x01GETMSG," + serverName + "\x04";
+                send(clientSocket, getMsgCommand.c_str(), getMsgCommand.length(), 0);
+                logMessage("Sent GETMSG command for server: " + serverName);
+
+                char buffer[5000];
+                while (true)
+                {
+                    int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+                    if (bytesRead > 0)
+                    {
+                        buffer[bytesRead] = '\0'; 
+                        std::string response(buffer);
+                        logMessage("Received message(s) to " + serverName + ": " + response);
+
+                        std::list<std::string> completeMessages = stripSOHEOT(response);
+                        for (const std::string &message : completeMessages)
+                        {
+                            // Split message into tokens by commas
+                            std::vector<std::string> tokens;
+                            std::stringstream ss(message);
+                            std::string token;
+
+                            while (std::getline(ss, token, ','))
+                            {
+                                tokens.push_back(token);
+                            }
+
+                            if (tokens.size() >= 4 && tokens[0] == "SENDMSG")
+                            {
+                                std::string toGroup = tokens[1];
+                                std::string fromGroup = tokens[2];
+                                std::string messageContent = tokens[3];
+
+                                // Only print the message content
+                                logMessage("Message from " + fromGroup + " to us: " + messageContent);
+                            }
+                            else
+                            {
+                                logMessage("Invalid or unknown message format: " + message);
+                            }
+                        }
+                    }
+                    else if (bytesRead == 0)
+                    {
+                        logMessage("Connection closed by the server.");
+                        break;
+                    }
+                    else
+                    {
+                        logMessage("Error receiving message or no more data.");
+                        break;
+                    }
+                }
+            }
+
+
+            // Check if this server is in our oneHopServers list
+            bool isInOneHop = false;
+            for (const auto& oneHop : oneHopServers)
+            {
+                if (oneHop.second.name == serverName)
+                {
+                    isInOneHop = true;
+                    break;
+                }
+            }
+
+            if (isInOneHop && numMessages > 0)
+            {
+                logMessage("There are " + std::to_string(numMessages) + " to be retrieved for " + serverName);
+
+                // Send GETMSG command to request those messages
+                std::string getMsgCommand = "\x01GETMSG," + serverName + "\x04";
+                send(clientSocket, getMsgCommand.c_str(), getMsgCommand.length(), 0);
+                logMessage("Sent GETMSG command for server: " + serverName);
+
+                char buffer[5000];
+                while (true)
+                {
+                    int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+                    if (bytesRead > 0)
+                    {
+                        buffer[bytesRead] = '\0'; 
+                        std::string response(buffer);
+                        logMessage("Received message(s) to " + serverName + ": " + response);
+
+                        std::list<std::string> completeMessages = stripSOHEOT(response);
+                        for (const std::string &message : completeMessages)
+                        {
+                            processCommand(clientSocket, message);
+                        }
+                    }
+                    else if (bytesRead == 0)
+                    {
+                        logMessage("Connection closed by the server.");
+                        break;
+                    }
+                    else
+                    {
+                        logMessage("Error receiving message or no more data.");
+                        break;
+                    }
+                }
+
+            }
+        }
     }
     else
     {
@@ -502,11 +628,53 @@ void processCommand(int clientSocket, const std::string &command)
     }
 }
 
+// Thread to send STATUSREQ packets
+void sendStatusReq()
+{
+    while (true)
+    {
+        std::this_thread::sleep_for(std::chrono::minutes(1)); // delay in minutes
+
+        std::lock_guard<std::mutex> lock(serverMutex); 
+        for (const auto &server : oneHopServers)
+        {
+            int serverSock = server.first;
+            std::string group = server.second.name; 
+            std::string statusReqMessage = "\x01STATUSREQ\x04"; // Form the STATUSREQ message
+
+            logMessage("Sending STATUSREQ message to server: " + group);
+            send(serverSock, statusReqMessage.c_str(), statusReqMessage.length(), 0);
+
+            // getting the STATUSRESP
+            char buffer[5000];
+            int bytes = recv(serverSock, buffer, sizeof(buffer) - 1, 0);
+
+            if (bytes <= 0)
+            {
+                logMessage("Group " + group + " did not reply with STATUSRESP.");
+                continue;
+            }
+
+            buffer[bytes] = '\0';
+            std::string response(buffer);
+
+            std::list<std::string> completeMessages = stripSOHEOT(response);
+            for (const std::string &message : completeMessages)
+            {
+                logMessage("response to STATUSREQ: " + message);
+                processCommand(serverSock, message);
+            }
+
+            logMessage("STATUSREQ message sent to " + group);
+        }
+    }
+}
+
 // Read incoming data and accumulate it until a full message is received
 int readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
 {
     char buffer[5000];
-    int bytes = recv(clientSocket, buffer, sizeof(buffer), 0);
+    int bytes = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
     std::string response(buffer);
 
     if (bytes <= 0)
@@ -515,6 +683,7 @@ int readClientData(int clientSocket, fd_set *openSockets, int *maxfds)
         closeClient(clientSocket, openSockets, maxfds);
         return -1;
     }
+    
 
     // Accumulate received data into the buffer for this client
     logMessage("Received " + std::to_string(bytes) + " bytes from client " + std::to_string(clientSocket));
@@ -573,7 +742,7 @@ void connectToInstructorServers()
         int bytesRead = recv(sock, buffer, sizeof(buffer) - 1, 0);
         if (bytesRead > 0)
         {
-            buffer[bytesRead] = '\0'; // Null-terminate the received data
+            buffer[bytesRead] = '\0';
             std::string response(buffer);
             // logMessage("Received response from port " + std::to_string(port) + ": " + response);
 
@@ -641,7 +810,7 @@ void scanPorts(int omittedPort)
         int bytesRead = recv(sock, buffer, sizeof(buffer) - 1, 0);
         if (bytesRead > 0)
         {
-            buffer[bytesRead] = '\0'; // Null-terminate the received data
+            buffer[bytesRead] = '\0';
             std::string response(buffer);
             // logMessage("Received response from port " + std::to_string(port) + ": " + response);
 
@@ -680,7 +849,7 @@ void scanPorts(int omittedPort)
         int bytesRead2 = recv(sock, buffer2, sizeof(buffer2) - 1, 0);
         if (bytesRead2 > 0)
         {
-            buffer[bytesRead2] = '\0'; // Null-terminate the received data
+            buffer[bytesRead2] = '\0';
             std::string response(buffer2);
             // logMessage("Received response from port " + std::to_string(port) + ": " + response);
 
@@ -740,7 +909,9 @@ int main(int argc, char *argv[])
     std::cout << "DONE CONNECTING TO INSTUCTORS SERVERS" << std::endl;
 
     std::thread keepAliveThread(sendKeepAlive);
-    keepAliveThread.detach(); // Detach the thread so it runs independently
+    std::thread statusReqThread(sendStatusReq);
+    keepAliveThread.detach(); // Detach the thread so they run independently
+    statusReqThread.detach();
 
     scanPorts(serverPort);
 
