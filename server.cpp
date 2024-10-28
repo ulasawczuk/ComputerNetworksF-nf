@@ -341,7 +341,7 @@ void processCommand(int clientSocket, const std::string &command)
     std::vector<std::string> tokens;
     std::string token;
     std::stringstream stream(command);
-    std::string ourGroup = "A5_12";
+    std::string ourGroup = "A5_1";
 
     // // Split command from client into tokens for parsing
     // while (std::getline(stream, token, ','))
@@ -390,11 +390,6 @@ void processCommand(int clientSocket, const std::string &command)
 
         parseServerResponse(tokens, connectedServers);
         oneHopServers[clientSocket].connectedServers = connectedServers;
-        std::string response;
-        for (const auto &server : connectedServers)
-        {
-            response += server.name + "," + server.ip + "," + std::to_string(server.port);
-        }
     }
     else if (tokens[0].compare("HELO") == 0 && tokens.size() == 2)
     {
@@ -484,7 +479,7 @@ void processCommand(int clientSocket, const std::string &command)
             {
                 logMessage("Sending message immediately to " + toGroup + " via one-hop server.");
 
-                std::string sendMsg = "\x01" + messageContent + "\x04";
+                std::string sendMsg = "\x01" + command + "\x04";
                 send(it->first, sendMsg.c_str(), sendMsg.length(), 0);
                 messageSent = true;
                 break;
@@ -860,7 +855,7 @@ void connectToInstructorServers()
 void scanPorts(int omittedPort)
 {
     const int startPort = 4000;
-    const int endPort = 4010;
+    const int endPort = 4008;
 
     for (int port = startPort; port <= endPort; ++port)
     {
@@ -884,7 +879,7 @@ void scanPorts(int omittedPort)
         server.sin_port = htons(port);
 
         // Set the timeout for the socket
-        setSocketTimeout(sock, 1);
+        setSocketTimeout(sock, 0.3);
 
         // Attempt to connect to the server
         if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0)
@@ -1033,7 +1028,7 @@ int main(int argc, char *argv[])
         {
             if (FD_ISSET(listenSock, &readSockets))
             {
-                clientLen = sizeof(client);
+                // clientLen = sizeof(client);
                 clientSock = accept(listenSock, (struct sockaddr *)&client, &clientLen);
                 if (clientSock < 0)
                 {
