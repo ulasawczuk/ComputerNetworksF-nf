@@ -2,7 +2,7 @@
 
 This server application is designed to manage one-hop connections with other servers, handle commands from clients, and log its activities. The client maintains a communication with our server and sends it commands.
 
-To compile the server and client code type "make" in terminal to activate the make file
+To compile the server and client code type "make" in terminal to activate the make file.
 
 Run the server by specifying a port number:
 ./tsamgroup12 <port>
@@ -53,3 +53,10 @@ Response: No response sent to the client.
 Additinally, the ERROR message that we process in STATUSRESP, it indicates an intrusive message and we don't process the rest of STATUSRESP.
 
 Each server action, including message processing and command responses, is logged with timestamps to track server activity and communication events.
+
+With the submission we also inlcude a wireshark trace of our client-server communication in the file wiresharkTraceass5.pcapng, and a pdf report where each section corresponds to point-giving section of the assignemt:
+1. Client-Server & Wireshark trace - Provide a wireshark trace of communication between your client and server for all commands implemented in the client to server protocol
+2. Connecting to Instructors servers - Have been successfully connected to by an Instructor’s server. (Provide timestamped log)
+3. Successfully received messages - Successfully receive messages from at least 2 other groups (Provide timestamped log)
+4. Successfully sent messages - Successfully send messages to at least 2 other groups (Provide timestamped log)
+5. Intruders (Bonus) - Identify the enemy. Provide IP and port of the process, timestamp, some relevant portion of your server log and a reason why you think this was an intruder in the network. (1 point per correctly identified instance, several instances need to be at least 2 hours apart)
