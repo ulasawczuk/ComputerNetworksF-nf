@@ -173,7 +173,7 @@ int open_socket(int portno)
 
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0)
     {
-        perror("Failed to open socket");
+        logMessage("Failed to create socket: " + std::string(strerror(errno)));
         return -1;
     }
     logMessage("Socket opened successfully.");
@@ -182,6 +182,7 @@ int open_socket(int portno)
     if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &set, sizeof(set)) < 0)
     {
         perror("Failed to set SO_REUSEADDR");
+        close(sock);
         return -1;
     }
     logMessage("SO_REUSEADDR set successfully.");
@@ -208,20 +209,58 @@ void sendKeepAlive()
 {
     while (true)
     {
-        std::this_thread::sleep_for(std::chrono::minutes(1)); // wait for 1 minute
+        // Add a small sleep at the start to prevent CPU spinning
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        
+        try {
+            std::lock_guard<std::mutex> lock(serverMutex);
+            
+            // Skip if no servers are connected
+            if (oneHopServers.empty()) {
+                continue;
+            }
 
-        std::lock_guard<std::mutex> lock(serverMutex); // locking the mutex
-        for (const auto &server : oneHopServers)
-        {
-            int serverSock = server.first;
-            std::string group = server.second.name;
-            int numMessages = messageQueue[group].size();
-            std::string keepAliveMessage = "\x01KEEPALIVE," + std::to_string(numMessages) + "\x04";
+            for (const auto &server : oneHopServers)
+            {
+                try {
+                    int serverSock = server.first;
+                    std::string group = server.second.name;
+                    
+                    // Skip if the server name is not yet known
+                    if (group == "m") {
+                        continue;
+                    }
+                    
+                    int numMessages = messageQueue[group].size();
+                    std::string keepAliveMessage = "\x01KEEPALIVE," + std::to_string(numMessages) + "\x04";
 
-            logMessage("Sending KEEPALIVE message to server: " + group);
-            send(serverSock, keepAliveMessage.c_str(), keepAliveMessage.length(), 0);
-            // logMessage("Confirming that message has been sent");
+                    logMessage("Attempting to send KEEPALIVE to " + group);
+                    
+                    // Check if socket is valid
+                    int error = 0;
+                    socklen_t len = sizeof(error);
+                    int retval = getsockopt(serverSock, SOL_SOCKET, SO_ERROR, &error, &len);
+                    
+                    if (retval == 0 && error == 0) {
+                        ssize_t sentBytes = send(serverSock, keepAliveMessage.c_str(), keepAliveMessage.length(), MSG_NOSIGNAL);
+                        if (sentBytes > 0) {
+                            logMessage("Successfully sent KEEPALIVE to " + group);
+                        } else {
+                            logMessage("Failed to send KEEPALIVE to " + group + ": " + std::string(strerror(errno)));
+                        }
+                    } else {
+                        logMessage("Socket " + std::to_string(serverSock) + " is invalid or disconnected");
+                    }
+                } catch (const std::exception& e) {
+                    logMessage("Error processing server in KEEPALIVE: " + std::string(e.what()));
+                }
+            }
+        } catch (const std::exception& e) {
+            logMessage("Error in KEEPALIVE thread: " + std::string(e.what()));
         }
+        
+        // Wait for 1 minute before next round of KEEPALIVE messages
+        std::this_thread::sleep_for(std::chrono::minutes(1));
     }
 }
 
@@ -248,7 +287,7 @@ void closeClient(int clientSocket, fd_set *openSockets, int *maxfds)
 
 void parseServerResponse(const std::vector<std::string> &tokens, std::vector<ServerInfo> &connectedServers)
 {
-    if (tokens[0] == "SERVERS" || tokens[0] == "LISTSERVERS")
+    if (tokens[0] == "SERVERS")
     {
         // Start parsing from the second token onward (since the first token is "SERVERS")
         for (int i = 1; i < tokens.size(); i += 4)
@@ -345,7 +384,7 @@ void processCommand(int clientSocket, const std::string &command)
     }
 
     // Handle the commands from servers and clients
-    if (tokens[0].compare("SERVERS") == 0 || tokens[0].compare("LISTSERVERS") == 0)
+    if (tokens[0].compare("SERVERS") == 0)
     {
         std::vector<ServerInfo> connectedServers;
 
@@ -434,6 +473,11 @@ void processCommand(int clientSocket, const std::string &command)
 
         bool messageSent = false;
 
+        if (toGroup == ourGroup){
+            logMessage("Message for us! " + messageContent);
+            return;
+        }
+
         for (std::map<int, ServerInfo>::iterator it = oneHopServers.begin(); it != oneHopServers.end(); ++it)
         {
             if (it->second.name == toGroup)
@@ -481,6 +525,18 @@ void processCommand(int clientSocket, const std::string &command)
             send(clientSocket, noMessages.c_str(), noMessages.length(), 0);
         }
     }
+    else if (tokens[0].compare("LISTSERVERS") == 0)
+    {
+        std::string response = "SERVERS,";
+
+        for (const auto &server : oneHopServers)
+        {
+
+            response += server.second.name + "," + server.second.ip + "," + std::to_string(server.second.port) + "; ";
+        }
+        std::string bufferedResponse = "\x01" + response + "\x04"; // Add SOT (0x02) at the start and EOT (0x04) at the end
+        send(clientSocket, bufferedResponse.c_str(), bufferedResponse.length(), 0);
+    }
     else if (tokens[0].compare("STATUSREQ") == 0)
     {
         logMessage("STATUSREQ received from client.");
@@ -517,7 +573,7 @@ void processCommand(int clientSocket, const std::string &command)
                 // Send GETMSG command to request those messages
                 std::string getMsgCommand = "\x01GETMSG," + serverName + "\x04";
                 send(clientSocket, getMsgCommand.c_str(), getMsgCommand.length(), 0);
-                logMessage("Sent GETMSG command for server: " + serverName);
+                logMessage("Sent GETMSG command to get our messages");
 
                 char buffer[5000];
                 while (true)
@@ -527,34 +583,12 @@ void processCommand(int clientSocket, const std::string &command)
                     {
                         buffer[bytesRead] = '\0'; 
                         std::string response(buffer);
-                        logMessage("Received message(s) to " + serverName + ": " + response);
+                        logMessage("Received message(s) for " + serverName + ": " + response);
 
                         std::list<std::string> completeMessages = stripSOHEOT(response);
                         for (const std::string &message : completeMessages)
                         {
-                            // Split message into tokens by commas
-                            std::vector<std::string> tokens;
-                            std::stringstream ss(message);
-                            std::string token;
-
-                            while (std::getline(ss, token, ','))
-                            {
-                                tokens.push_back(token);
-                            }
-
-                            if (tokens.size() >= 4 && tokens[0] == "SENDMSG")
-                            {
-                                std::string toGroup = tokens[1];
-                                std::string fromGroup = tokens[2];
-                                std::string messageContent = tokens[3];
-
-                                // Only print the message content
-                                logMessage("Message from " + fromGroup + " to us: " + messageContent);
-                            }
-                            else
-                            {
-                                logMessage("Invalid or unknown message format: " + message);
-                            }
+                            processCommand(clientSocket, message);
                         }
                     }
                     else if (bytesRead == 0)
@@ -581,30 +615,44 @@ void processCommand(int clientSocket, const std::string &command)
                     break;
                 }
             }
+            // we chose not to retrieve messages to groups that are not on our one hop servers
+            if (!isInOneHop){
+                logMessage("Group not on our OneHopServers, not getting messages for them.");
+            }
 
             if (isInOneHop && numMessages > 0)
             {
-                logMessage("There are " + std::to_string(numMessages) + " to be retrieved for " + serverName);
+                logMessage("There are " + std::to_string(numMessages) + " messages to be retrieved for " + serverName);
 
                 // Send GETMSG command to request those messages
                 std::string getMsgCommand = "\x01GETMSG," + serverName + "\x04";
                 send(clientSocket, getMsgCommand.c_str(), getMsgCommand.length(), 0);
-                logMessage("Sent GETMSG command for server: " + serverName);
+                logMessage("Sent GETMSG command to get messages for server: " + serverName);
 
                 char buffer[5000];
+                bool errorReceived = false;
                 while (true)
                 {
+                    if (errorReceived) {  // Check if we received an error in previous iteration
+                        break;  // stop processing the messages if error recieved
+                    }
                     int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
                     if (bytesRead > 0)
                     {
                         buffer[bytesRead] = '\0'; 
                         std::string response(buffer);
-                        logMessage("Received message(s) to " + serverName + ": " + response);
+                        logMessage("Received message for " + serverName + ": " + response);
 
                         std::list<std::string> completeMessages = stripSOHEOT(response);
                         for (const std::string &message : completeMessages)
                         {
-                            processCommand(clientSocket, message);
+                            if (message.substr(0, 5) == "ERROR")
+                            {
+                                logMessage("Got an error message, not processing all of the messages as it might be an intruder.");
+                                errorReceived = true;
+                                break;
+                            }
+                            processCommand(clientSocket, message); // even though we pass the clientSock here, later it gets changed to the correct socket
                         }
                     }
                     else if (bytesRead == 0)
@@ -633,40 +681,86 @@ void sendStatusReq()
 {
     while (true)
     {
-        std::this_thread::sleep_for(std::chrono::minutes(1)); // delay in minutes
-
-        std::lock_guard<std::mutex> lock(serverMutex); 
-        for (const auto &server : oneHopServers)
-        {
-            int serverSock = server.first;
-            std::string group = server.second.name; 
-            std::string statusReqMessage = "\x01STATUSREQ\x04"; // Form the STATUSREQ message
-
-            logMessage("Sending STATUSREQ message to server: " + group);
-            send(serverSock, statusReqMessage.c_str(), statusReqMessage.length(), 0);
-
-            // getting the STATUSRESP
-            char buffer[5000];
-            int bytes = recv(serverSock, buffer, sizeof(buffer) - 1, 0);
-
-            if (bytes <= 0)
-            {
-                logMessage("Group " + group + " did not reply with STATUSRESP.");
+        std::this_thread::sleep_for(std::chrono::seconds(1)); // wait for one minute
+        
+        try {
+            std::lock_guard<std::mutex> lock(serverMutex);
+            
+            // Skip if no servers are connected
+            if (oneHopServers.empty()) {
                 continue;
             }
 
-            buffer[bytes] = '\0';
-            std::string response(buffer);
-
-            std::list<std::string> completeMessages = stripSOHEOT(response);
-            for (const std::string &message : completeMessages)
+            for (const auto &server : oneHopServers)
             {
-                logMessage("response to STATUSREQ: " + message);
-                processCommand(serverSock, message);
-            }
+                try {
+                    int serverSock = server.first;
+                    std::string group = server.second.name;
+                    
+                    // Skip if the server name is not yet known
+                    if (group == "m") {
+                        continue;
+                    }
+                    
+                    std::string statusReqMessage = "\x01STATUSREQ\x04";
+                    
+                    logMessage("Attempting to send STATUSREQ to " + group);
+                    
+                    // Check if socket is valid
+                    int error = 0;
+                    socklen_t len = sizeof(error);
+                    int retval = getsockopt(serverSock, SOL_SOCKET, SO_ERROR, &error, &len);
+                    
+                    if (retval == 0 && error == 0) {
+                        ssize_t sentBytes = send(serverSock, statusReqMessage.c_str(), statusReqMessage.length(), MSG_NOSIGNAL);
+                        if (sentBytes > 0) {
+                            logMessage("Successfully sent STATUSREQ to " + group);
+                            
+                            // Wait for response with timeout
+                            fd_set readSet;
+                            struct timeval timeout;
+                            FD_ZERO(&readSet);
+                            FD_SET(serverSock, &readSet);
+                            timeout.tv_sec = 5;  // 5 second timeout
+                            timeout.tv_usec = 0;
+                            
+                            if (select(serverSock + 1, &readSet, NULL, NULL, &timeout) > 0) {
+                                char buffer[5000];
 
-            logMessage("STATUSREQ message sent to " + group);
+                                while (true){
+                                    int bytes = recv(serverSock, buffer, sizeof(buffer) - 1, 0);
+                                    
+                                    if (bytes > 0) {
+                                        buffer[bytes] = '\0';
+                                        std::string response(buffer);
+                                        
+                                        std::list<std::string> completeMessages = stripSOHEOT(response);
+                                        for (const std::string &message : completeMessages) {
+                                            processCommand(serverSock, message);
+                                        }
+                                    }else{
+                                        break;
+                                    }
+                                }
+                            } else {
+                                logMessage("Timeout waiting for STATUSRESP from " + group);
+                            }
+                        } else {
+                            logMessage("Failed to send STATUSREQ to " + group + ": " + std::string(strerror(errno)));
+                        }
+                    } else {
+                        logMessage("Socket " + std::to_string(serverSock) + " is invalid or disconnected");
+                    }
+                } catch (const std::exception& e) {
+                    logMessage("Error processing server in STATUSREQ: " + std::string(e.what()));
+                }
+            }
+        } catch (const std::exception& e) {
+            logMessage("Error in STATUSREQ thread: " + std::string(e.what()));
         }
+        
+        // Wait for 1 minute before next round of STATUSREQ messages
+        std::this_thread::sleep_for(std::chrono::minutes(1));
     }
 }
 
@@ -738,6 +832,9 @@ void connectToInstructorServers()
         send(sock, helloMessage.c_str(), helloMessage.length(), 0);
         logMessage("Sent HELO message to " + name);
 
+        // want to wait for a second for response with servers because somtimes we don't get it
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
         char buffer[5000];
         int bytesRead = recv(sock, buffer, sizeof(buffer) - 1, 0);
         if (bytesRead > 0)
@@ -803,7 +900,9 @@ void scanPorts(int omittedPort)
         std::string fromGroup = "A5_12"; // Adjust group name as necessary
         std::string helloMessage = "\x01HELO," + fromGroup + "\x04";
         send(sock, helloMessage.c_str(), helloMessage.length(), 0);
-        // logMessage("Sent HELO message to port: " + std::to_string(port));
+        
+        // want to wait for a second for response with servers because somtimes we don't get it
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 
         // Read response
         char buffer[5000];
@@ -882,20 +981,20 @@ int main(int argc, char *argv[])
     int serverPort = atoi(argv[1]);
     logMessage("Starting chat server...");
 
-    listenSock = open_socket(atoi(argv[1]));
+    listenSock = open_socket(serverPort);
     if (listenSock < 0)
     {
         logMessage("Failed to start server.");
         exit(0);
     }
 
-    logMessage("Listening on port: " + std::to_string(atoi(argv[1])));
-
     if (listen(listenSock, BACKLOG) < 0)
     {
         perror("Listen failed");
         exit(0);
     }
+
+    logMessage("Listening on port: " + std::to_string(serverPort));
 
     FD_ZERO(&openSockets);
     FD_SET(listenSock, &openSockets);
@@ -908,16 +1007,17 @@ int main(int argc, char *argv[])
 
     std::cout << "DONE CONNECTING TO INSTUCTORS SERVERS" << std::endl;
 
-    std::thread keepAliveThread(sendKeepAlive);
-    std::thread statusReqThread(sendStatusReq);
-    keepAliveThread.detach(); // Detach the thread so they run independently
-    statusReqThread.detach();
-
     scanPorts(serverPort);
 
     printOneHopServers();
 
     logMessage("Waiting for connections...");
+
+    std::thread keepAliveThread(sendKeepAlive);
+    std::thread statusReqThread(sendStatusReq);
+    keepAliveThread.detach(); // Detach the thread so they run independently
+    statusReqThread.detach();
+
 
     while (!finished)
     {
@@ -933,11 +1033,11 @@ int main(int argc, char *argv[])
         {
             if (FD_ISSET(listenSock, &readSockets))
             {
+                clientLen = sizeof(client);
                 clientSock = accept(listenSock, (struct sockaddr *)&client, &clientLen);
                 if (clientSock < 0)
                 {
-                    perror("Accept failed");
-                    // Sending KEEPALIVE message to server
+                    logMessage("Accept failed with error " + std::to_string(errno) + ": " + std::string(strerror(errno)));
                     continue;
                 }
 
