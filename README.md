@@ -5,10 +5,11 @@ This server application is designed to manage one-hop connections with other ser
 To compile the server and client code type "make" in terminal to activate the make file
 
 Run the server by specifying a port number:
-./server <port>
+./tsamgroup12 <port>
 The server will start listening for incoming connections on the specified port.
 
 Run the client by specifing the IP address and a port number:
+./client <server_ip> <server_port>
 
 
 COMMAND OVERVIEW
